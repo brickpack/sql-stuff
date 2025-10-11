@@ -34,9 +34,9 @@ npm run preview
 
 ### Automatic Deployment (Recommended)
 
-1. **Push to GitHub**: Commit and push your code to the `main` branch
-2. **Enable GitHub Pages**: Go to your repository Settings → Pages
-3. **Select Source**: Choose "GitHub Actions" as the source
+1. **Enable GitHub Pages**: Go to your repository Settings → Pages
+2. **Select Source**: Choose "GitHub Actions" as the source
+3. **Push to GitHub**: Commit and push your code to the `main` branch
 4. **Automatic Deployment**: The GitHub Action will automatically deploy on every push to `main`
 
 ### Manual Deployment
