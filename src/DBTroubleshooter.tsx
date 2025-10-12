@@ -1151,7 +1151,6 @@ const DBTroubleshooter = () => {
         {
           title: "Get the Execution Plan",
           description: "Use EXPLAIN to analyze query execution without running it",
-          query: "your_query_here",
           sql: "EXPLAIN USING TEXT\nyour_query_here;",
           guidance: [
             "💡 How to Read Snowflake EXPLAIN Output:",
