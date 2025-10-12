@@ -1471,21 +1471,23 @@ const DBTroubleshooter = () => {
 
   if (!dbType) {
     return (
-      <div className="max-w-4xl mx-auto p-6">
-        <div className="text-center mb-8">
-          <Database className="w-16 h-16 mx-auto mb-4 text-blue-600" />
-          <h1 className="text-3xl font-bold mb-2">Database Query Troubleshooter</h1>
-          <p className="text-gray-600">Interactive guide to diagnose and fix slow queries</p>
-        </div>
-        <div className="mb-6">
-          <label className="block text-sm font-medium mb-2">Select Your Database Type:</label>
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-            {['postgresql', 'mysql', 'sqlserver', 'oracle', 'snowflake'].map((db) => (
-              <button key={db} onClick={() => setDbType(db)} className="p-6 border-2 border-gray-200 rounded-lg hover:border-blue-500 hover:bg-blue-50 transition-all">
-                <Database className="w-8 h-8 mx-auto mb-2 text-blue-600" />
-                <div className="font-semibold capitalize">{db === 'sqlserver' ? 'SQL Server' : db === 'postgresql' ? 'PostgreSQL' : db === 'oracle' ? 'Oracle' : db === 'snowflake' ? 'Snowflake' : 'MySQL'}</div>
-              </button>
-            ))}
+      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-800">
+        <div className="max-w-4xl mx-auto p-6">
+          <div className="text-center mb-8 pt-12">
+            <Database className="w-20 h-20 mx-auto mb-6 text-cyan-400 drop-shadow-[0_0_15px_rgba(34,211,238,0.5)]" />
+            <h1 className="text-4xl font-bold mb-3 bg-gradient-to-r from-cyan-300 via-blue-300 to-cyan-400 bg-clip-text text-transparent">Database Query Troubleshooter</h1>
+            <p className="text-slate-300 text-lg">Interactive guide to diagnose and fix slow queries</p>
+          </div>
+          <div className="mb-6">
+            <label className="block text-sm font-medium mb-4 text-slate-300">Select Your Database Type:</label>
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+              {['postgresql', 'mysql', 'sqlserver', 'oracle', 'snowflake'].map((db) => (
+                <button key={db} onClick={() => setDbType(db)} className="group p-6 border-2 border-slate-700 bg-slate-800/50 backdrop-blur-sm rounded-xl hover:border-cyan-500 hover:bg-gradient-to-br hover:from-slate-800 hover:to-slate-700 hover:shadow-[0_0_30px_rgba(34,211,238,0.2)] transition-all duration-300">
+                  <Database className="w-8 h-8 mx-auto mb-2 text-slate-400 group-hover:text-cyan-400 transition-colors duration-300" />
+                  <div className="font-semibold text-slate-300 group-hover:text-cyan-300 transition-colors duration-300">{db === 'sqlserver' ? 'SQL Server' : db === 'postgresql' ? 'PostgreSQL' : db === 'oracle' ? 'Oracle' : db === 'snowflake' ? 'Snowflake' : 'MySQL'}</div>
+                </button>
+              ))}
+            </div>
           </div>
         </div>
       </div>
@@ -1493,55 +1495,57 @@ const DBTroubleshooter = () => {
   }
 
   return (
-    <div className="max-w-6xl mx-auto p-6">
-      <div className="mb-6 flex items-center justify-between">
-        <div>
-          <button onClick={() => { setDbType(''); setCurrentStep(0); setFindings({}); }} className="text-sm text-blue-600 hover:text-blue-800 mb-2">← Change Database</button>
-          <h1 className="text-2xl font-bold">{dbType === 'sqlserver' ? 'SQL Server' : dbType === 'postgresql' ? 'PostgreSQL' : dbType === 'oracle' ? 'Oracle' : dbType === 'snowflake' ? 'Snowflake' : 'MySQL'} Troubleshooting</h1>
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-800">
+      <div className="max-w-6xl mx-auto p-6">
+        <div className="mb-6 flex items-center justify-between">
+          <div>
+            <button onClick={() => { setDbType(''); setCurrentStep(0); setFindings({}); }} className="text-sm text-cyan-400 hover:text-cyan-300 mb-2 transition-colors duration-200">← Change Database</button>
+            <h1 className="text-2xl font-bold bg-gradient-to-r from-cyan-300 to-blue-300 bg-clip-text text-transparent">{dbType === 'sqlserver' ? 'SQL Server' : dbType === 'postgresql' ? 'PostgreSQL' : dbType === 'oracle' ? 'Oracle' : dbType === 'snowflake' ? 'Snowflake' : 'MySQL'} Troubleshooting</h1>
+          </div>
+          <div className="text-sm text-slate-400">Step {currentStep + 1} of {steps.length}</div>
         </div>
-        <div className="text-sm text-gray-600">Step {currentStep + 1} of {steps.length}</div>
-      </div>
 
-      <div className="mb-6 bg-amber-50 border-l-4 border-amber-500 p-4 rounded">
-        <div className="flex items-start gap-2">
-          <AlertCircle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
-          <div className="text-sm text-amber-900"><strong>Important:</strong> These are general guidelines. Verify with execution plans and test in non-production first.</div>
+        <div className="mb-6 bg-gradient-to-r from-amber-900/30 to-orange-900/30 border-l-4 border-amber-500 p-4 rounded-lg backdrop-blur-sm">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
+            <div className="text-sm text-amber-200"><strong>Important:</strong> These are general guidelines. Verify with execution plans and test in non-production first.</div>
+          </div>
         </div>
-      </div>
 
-        <div className="mb-6"><div className="flex gap-2">{steps.map((_: Step, idx: number) => (<div key={idx} className={`flex-1 h-2 rounded ${idx <= currentStep ? 'bg-blue-600' : 'bg-gray-200'}`} />))}</div></div>
+        <div className="mb-6"><div className="flex gap-2">{steps.map((_: Step, idx: number) => (<div key={idx} className={`flex-1 h-2 rounded-full ${idx <= currentStep ? 'bg-gradient-to-r from-cyan-500 to-blue-500 shadow-[0_0_10px_rgba(34,211,238,0.5)]' : 'bg-slate-700'}`} />))}</div></div>
 
-      <div className="bg-white border rounded-lg shadow-sm">
-        <div className="bg-gradient-to-r from-blue-600 to-blue-700 text-white p-4 rounded-t-lg">
-          <h2 className="text-xl font-semibold">{currentStepData?.title}</h2>
-          <p className="text-blue-100 text-sm mt-1">{currentStepData?.description}</p>
-        </div>
+        <div className="bg-slate-800/50 backdrop-blur-md border border-slate-700 rounded-xl shadow-[0_8px_30px_rgba(0,0,0,0.4)]">
+          <div className="bg-gradient-to-r from-slate-800 via-blue-900 to-slate-800 border-b border-slate-700 text-white p-5 rounded-t-xl">
+            <h2 className="text-xl font-semibold text-cyan-300">{currentStepData?.title}</h2>
+            <p className="text-slate-300 text-sm mt-1">{currentStepData?.description}</p>
+          </div>
 
         <div className="p-6">
           {currentStepData?.sql && (
             <div className="mb-6">
-              {currentStepData?.warning && (<div className="mb-3 bg-orange-50 border-l-4 border-orange-400 p-3 rounded"><p className="text-sm text-orange-800 font-medium">{currentStepData.warning}</p></div>)}
+              {currentStepData?.warning && (<div className="mb-3 bg-gradient-to-r from-orange-900/40 to-red-900/40 border-l-4 border-orange-500 p-3 rounded-lg backdrop-blur-sm"><p className="text-sm text-orange-200 font-medium">{currentStepData.warning}</p></div>)}
               <div className="flex items-center justify-between mb-2">
-                <h3 className="font-semibold flex items-center gap-2"><Play className="w-4 h-4" />Run This Query:</h3>
-                <button onClick={() => copyToClipboard(currentStepData.sql || '', 'sql')} className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800"><Copy className="w-4 h-4" />{copiedIndex === 'sql' ? 'Copied!' : 'Copy'}</button>
+                <h3 className="font-semibold flex items-center gap-2 text-slate-200"><Play className="w-4 h-4 text-cyan-400" />Run This Query:</h3>
+                <button onClick={() => copyToClipboard(currentStepData.sql || '', 'sql')} className="flex items-center gap-1 text-sm text-cyan-400 hover:text-cyan-300 transition-colors duration-200"><Copy className="w-4 h-4" />{copiedIndex === 'sql' ? 'Copied!' : 'Copy'}</button>
               </div>
-              <pre className="bg-gray-800 text-gray-100 p-4 rounded overflow-x-auto text-sm">{currentStepData.sql}</pre>
+              <pre className="bg-slate-950 border border-slate-700 text-cyan-100 p-4 rounded-lg overflow-x-auto text-sm shadow-inner">{currentStepData.sql}</pre>
             </div>
           )}
 
-          {currentStepData?.checks && (<div className="mb-6 bg-yellow-50 border border-yellow-200 rounded-lg p-4"><h3 className="font-semibold mb-3 flex items-center gap-2"><AlertCircle className="w-5 h-5 text-yellow-600" />Check for These Issues:</h3>{currentStepData.checks.map((check: Check, idx: number) => (<div key={idx} className="flex items-center gap-2 mb-2"><input type="checkbox" id={`check-${idx}`} checked={findings[check.key] || false} onChange={(e) => setFindings(prev => ({ ...prev, [check.key]: e.target.checked }))} className="w-4 h-4" /><label htmlFor={`check-${idx}`} className="text-sm">{check.label}</label></div>))}</div>)}
+          {currentStepData?.checks && (<div className="mb-6 bg-gradient-to-br from-yellow-900/30 to-amber-900/30 border border-yellow-700/50 rounded-lg p-4 backdrop-blur-sm"><h3 className="font-semibold mb-3 flex items-center gap-2 text-yellow-300"><AlertCircle className="w-5 h-5 text-yellow-400" />Check for These Issues:</h3>{currentStepData.checks.map((check: Check, idx: number) => (<div key={idx} className="flex items-center gap-2 mb-2"><input type="checkbox" id={`check-${idx}`} checked={findings[check.key] || false} onChange={(e) => setFindings(prev => ({ ...prev, [check.key]: e.target.checked }))} className="w-4 h-4 accent-cyan-500" /><label htmlFor={`check-${idx}`} className="text-sm text-slate-200">{check.label}</label></div>))}</div>)}
 
-          {currentStepData?.action && (<div className="mb-6"><div className="flex items-center justify-between mb-2"><h3 className="font-semibold flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" />Fix With:</h3><button onClick={() => copyToClipboard(currentStepData.action || '', 'action')} className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800"><Copy className="w-4 h-4" />{copiedIndex === 'action' ? 'Copied!' : 'Copy'}</button></div><pre className="bg-green-50 border border-green-200 p-4 rounded overflow-x-auto text-sm">{currentStepData.action}</pre></div>)}
+          {currentStepData?.action && (<div className="mb-6"><div className="flex items-center justify-between mb-2"><h3 className="font-semibold flex items-center gap-2 text-slate-200"><CheckCircle className="w-4 h-4 text-emerald-400" />Fix With:</h3><button onClick={() => copyToClipboard(currentStepData.action || '', 'action')} className="flex items-center gap-1 text-sm text-cyan-400 hover:text-cyan-300 transition-colors duration-200"><Copy className="w-4 h-4" />{copiedIndex === 'action' ? 'Copied!' : 'Copy'}</button></div><pre className="bg-gradient-to-br from-emerald-950/50 to-green-950/50 border border-emerald-700/50 p-4 rounded-lg overflow-x-auto text-sm text-emerald-100 shadow-inner">{currentStepData.action}</pre></div>)}
 
-          {currentStepData?.examples && (<div className="mb-6"><h3 className="font-semibold mb-3">Common Patterns to Fix:</h3>{currentStepData.examples.map((example: Example, idx: number) => (<div key={idx} className="mb-4 border-l-4 border-red-300 pl-4"><div className="mb-2"><span className="text-xs font-semibold text-red-600 uppercase">❌ Bad:</span><pre className="bg-red-50 p-2 rounded text-xs mt-1 overflow-x-auto">{example.bad}</pre></div><div className="mb-2"><span className="text-xs font-semibold text-green-600 uppercase">✅ Good:</span><pre className="bg-green-50 p-2 rounded text-xs mt-1 overflow-x-auto">{example.good}</pre></div>{example.why && (<div className="mt-2 text-xs text-gray-600 italic">💡 Why: {example.why}</div>)}</div>))}</div>)}
+          {currentStepData?.examples && (<div className="mb-6"><h3 className="font-semibold mb-3 text-slate-200">Common Patterns to Fix:</h3>{currentStepData.examples.map((example: Example, idx: number) => (<div key={idx} className="mb-4 border-l-4 border-red-500/50 pl-4 bg-slate-900/30 p-3 rounded-r-lg"><div className="mb-2"><span className="text-xs font-semibold text-red-400 uppercase">❌ Bad:</span><pre className="bg-red-950/40 border border-red-900/50 p-2 rounded text-xs mt-1 overflow-x-auto text-red-200">{example.bad}</pre></div><div className="mb-2"><span className="text-xs font-semibold text-emerald-400 uppercase">✅ Good:</span><pre className="bg-emerald-950/40 border border-emerald-900/50 p-2 rounded text-xs mt-1 overflow-x-auto text-emerald-200">{example.good}</pre></div>{example.why && (<div className="mt-2 text-xs text-slate-400 italic">💡 Why: {example.why}</div>)}</div>))}</div>)}
 
-          {currentStepData?.guidance && (<div className="bg-blue-50 border border-blue-200 rounded-lg p-4"><h3 className="font-semibold mb-2">💡 Key Points:</h3><ul className="space-y-2">{currentStepData.guidance.map((point: string, idx: number) => (<li key={idx} className="text-sm flex items-start gap-2"><span className="text-blue-600 mt-0.5">•</span><span>{point}</span></li>))}</ul></div>)}
+          {currentStepData?.guidance && (<div className="bg-gradient-to-br from-blue-900/30 to-cyan-900/30 border border-blue-700/50 rounded-lg p-4 backdrop-blur-sm"><h3 className="font-semibold mb-2 text-cyan-300">�� Key Points:</h3><ul className="space-y-2">{currentStepData.guidance.map((point: string, idx: number) => (<li key={idx} className="text-sm flex items-start gap-2"><span className="text-cyan-400 mt-0.5">•</span><span className="text-slate-300">{point}</span></li>))}</ul></div>)}
         </div>
       </div>
 
       <div className="mt-6 flex justify-between">
-        <button onClick={() => setCurrentStep(Math.max(0, currentStep - 1))} disabled={currentStep === 0} className="px-4 py-2 border rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed">← Previous</button>
-        <button onClick={() => setCurrentStep(Math.min(steps.length - 1, currentStep + 1))} disabled={currentStep === steps.length - 1} className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2">Next <ChevronRight className="w-4 h-4" /></button>
+        <button onClick={() => setCurrentStep(Math.max(0, currentStep - 1))} disabled={currentStep === 0} className="px-6 py-3 border-2 border-slate-700 bg-slate-800/50 text-slate-300 rounded-lg hover:bg-slate-700 hover:border-slate-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200">← Previous</button>
+        <button onClick={() => setCurrentStep(Math.min(steps.length - 1, currentStep + 1))} disabled={currentStep === steps.length - 1} className="px-6 py-3 bg-gradient-to-r from-cyan-600 to-blue-600 text-white rounded-lg hover:from-cyan-500 hover:to-blue-500 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 shadow-[0_0_20px_rgba(34,211,238,0.3)] transition-all duration-200">Next <ChevronRight className="w-4 h-4" /></button>
+      </div>
       </div>
     </div>
   );
