@@ -4,7 +4,7 @@ An interactive React application that helps developers diagnose and fix slow dat
 
 ## Features
 
-- **Multi-Database Support**: PostgreSQL, MySQL, SQL Server, Oracle
+- **Multi-Database Support**: PostgreSQL, MySQL, SQL Server, Oracle, Snowflake
 - **Step-by-Step Guidance**: Interactive troubleshooting workflows
 - **Copy-to-Clipboard**: Easy SQL query copying
 - **Responsive Design**: Works on desktop and mobile

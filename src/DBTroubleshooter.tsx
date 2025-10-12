@@ -319,13 +319,15 @@ const DBTroubleshooter = () => {
             { bad: "SELECT COUNT(*) FROM large_table\nWHERE status = 'active'", good: "SELECT reltuples::bigint\nFROM pg_class\nWHERE relname = 'large_table'", why: "Exact count scans entire table; approximate is instant from stats" },
             { bad: "SELECT DISTINCT column FROM table", good: "SELECT column FROM table\nGROUP BY column", why: "DISTINCT requires sort; GROUP BY can use indexes more efficiently" },
             { bad: "WHERE LOWER(email) = 'user@example.com'", good: "CREATE INDEX idx ON table(LOWER(email));\nWHERE LOWER(email) = 'user@example.com'", why: "Function prevents normal index use; expression index solves this" },
+            { bad: "WHERE UPPER(name) = 'JOHN'", good: "WHERE name ILIKE 'john'", why: "UPPER() prevents index usage; ILIKE is case-insensitive and more efficient" },
             { bad: "SELECT * FROM orders\nWHERE amount > 1000 OR status = 'urgent'", good: "SELECT * FROM orders WHERE amount > 1000\nUNION\nSELECT * FROM orders WHERE status = 'urgent'", why: "OR prevents using multiple indexes; UNION allows index on each condition" }
           ],
           guidance: [
             "Replace IN with JOINs",
             "Avoid functions on indexed columns",
             "Use EXISTS instead of IN for large subqueries",
-            "Create expression indexes for functions in WHERE clause"
+            "Create expression indexes for functions in WHERE clause",
+            "Use ILIKE instead of UPPER()/LOWER() for case-insensitive searches"
           ]
         },
         {
@@ -445,14 +447,16 @@ const DBTroubleshooter = () => {
             { bad: "SELECT * FROM orders\nORDER BY created_at DESC\nLIMIT 1000, 10", good: "WHERE id > @last_id\nORDER BY id LIMIT 10", why: "Large OFFSET scans all skipped rows; cursor seeks directly" },
             { bad: "WHERE id IN (1,2,3...1000)", good: "CREATE TEMPORARY TABLE temp_ids (id INT);\nINSERT INTO temp_ids VALUES (1),(2),(3);\nJOIN temp_ids ON table.id = temp_ids.id", why: "Large IN list causes parse overhead; temp table optimizes better" },
             { bad: "SELECT * FROM table\nWHERE status != 'deleted'", good: "WHERE status IN ('active', 'pending', 'complete')", why: "!= can't use index efficiently; IN with known values uses index" },
-            { bad: "WHERE YEAR(order_date) = 2024\n  AND MONTH(order_date) = 1", good: "WHERE order_date >= '2024-01-01'\n  AND order_date < '2024-02-01'", why: "Functions prevent index usage; range comparison uses index" }
+            { bad: "WHERE YEAR(order_date) = 2024\n  AND MONTH(order_date) = 1", good: "WHERE order_date >= '2024-01-01'\n  AND order_date < '2024-02-01'", why: "Functions prevent index usage; range comparison uses index" },
+            { bad: "WHERE UPPER(name) = 'JOHN'", good: "WHERE name ILIKE 'john'", why: "UPPER() prevents index usage; ILIKE is case-insensitive and more efficient" }
           ],
           guidance: [
             "OR prevents index usage - use UNION instead",
             "Avoid functions on indexed columns",
             "Leading wildcards can't use indexes",
             "Use cursor pagination instead of OFFSET for large datasets",
-            "Prefer positive conditions over NOT/!= when possible"
+            "Prefer positive conditions over NOT/!= when possible",
+            "Use ILIKE instead of UPPER()/LOWER() for case-insensitive searches"
           ]
         },
         {
@@ -592,6 +596,188 @@ const DBTroubleshooter = () => {
             "💡 Tip: CTEs can be materialized with MATERIALIZE hint or inlined with INLINE hint for tuning"
           ]
         }
+      ],
+      snowflake: [
+        {
+          title: "Analyze Query Profile",
+          description: "Use Snowflake's Query Profile to understand execution details",
+          sql: "-- Enable query profiling (run before your query)\nALTER SESSION SET QUERY_TAG = 'troubleshooting_query';\n\n-- Your query here\nyour_query_here;\n\n-- View query profile\nSELECT * FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY())\nWHERE QUERY_TAG = 'troubleshooting_query'\nORDER BY START_TIME DESC\nLIMIT 1;",
+          warning: "⚠️ Query Profile shows actual execution details but requires the query to complete. For very slow queries, consider using EXPLAIN PLAN first.",
+          guidance: [
+            "Query Profile shows actual execution statistics, not estimates",
+            "Look for high 'Bytes Scanned' vs 'Bytes Spilled' ratios",
+            "Check 'Partitions Scanned' vs 'Partitions Total' - high ratios indicate inefficient pruning",
+            "Monitor 'Remote I/O' - high values suggest data movement between compute nodes",
+            "Check 'Spilling' - indicates insufficient memory allocation"
+          ],
+          checks: [
+            { label: "Query execution time > 30 seconds?", key: "slowExecution" },
+            { label: "High Bytes Spilled (>1GB)?", key: "highSpilling" },
+            { label: "Low partition pruning (<50% partitions scanned)?", key: "poorPruning" },
+            { label: "High Remote I/O (>100MB)?", key: "highRemoteIO" },
+            { label: "Many micro-partitions scanned?", key: "manyPartitions" },
+            { label: "Query using external tables?", key: "externalTables" }
+          ]
+        },
+        {
+          title: "Check Warehouse Size and Scaling",
+          description: "Verify compute resources are adequate",
+          sql: "-- Check current warehouse settings\nSHOW WAREHOUSES;\n\n-- Check warehouse usage history\nSELECT \n    WAREHOUSE_NAME,\n    AVG(AVG_RUNNING) as avg_running,\n    AVG(AVG_QUEUED) as avg_queued,\n    AVG(AVG_BLOCKED) as avg_blocked\nFROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_EVENTS_HISTORY\nWHERE START_TIME >= DATEADD(day, -7, CURRENT_TIMESTAMP())\nGROUP BY WAREHOUSE_NAME\nORDER BY avg_running DESC;\n\n-- Check for warehouse scaling events\nSELECT \n    WAREHOUSE_NAME,\n    EVENT_NAME,\n    COUNT(*) as event_count\nFROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_EVENTS_HISTORY\nWHERE START_TIME >= DATEADD(day, -1, CURRENT_TIMESTAMP())\n    AND EVENT_NAME IN ('WAREHOUSE_RESUMING', 'WAREHOUSE_SCALING_UP', 'WAREHOUSE_SCALING_DOWN')\nGROUP BY WAREHOUSE_NAME, EVENT_NAME\nORDER BY event_count DESC;",
+          action: "-- Scale up warehouse temporarily for testing\nALTER WAREHOUSE your_warehouse_name SET WAREHOUSE_SIZE = 'LARGE';\n\n-- Enable auto-scaling\nALTER WAREHOUSE your_warehouse_name SET AUTO_SUSPEND = 60;\nALTER WAREHOUSE your_warehouse_name SET AUTO_RESUME = TRUE;\n\n-- Set scaling policy\nALTER WAREHOUSE your_warehouse_name SET SCALING_POLICY = 'STANDARD';",
+          warning: "⚠️ Larger warehouses cost more credits. Test performance improvements before permanently scaling up. Monitor credit usage in Account Usage views.",
+          guidance: [
+            "💡 Warehouse Sizing:",
+            "• X-Small: 1 credit/hour, 1 server",
+            "• Small: 2 credits/hour, 2 servers", 
+            "• Medium: 4 credits/hour, 4 servers",
+            "• Large: 8 credits/hour, 8 servers",
+            "• X-Large: 16 credits/hour, 16 servers",
+            "",
+            "💡 Auto-scaling Benefits:",
+            "• Automatically scales up during high load",
+            "• Scales down during low activity",
+            "• Reduces costs while maintaining performance",
+            "",
+            "💡 When to Scale Up:",
+            "• Queries consistently taking >30 seconds",
+            "• High queuing times (avg_queued > 0)",
+            "• Frequent warehouse scaling events",
+            "• Memory-intensive operations (large sorts, joins)",
+            "",
+            "💡 Cost Optimization:",
+            "• Use auto-suspend to pause idle warehouses",
+            "• Monitor credit usage with Account Usage views",
+            "• Consider query optimization before scaling"
+          ]
+        },
+        {
+          title: "Optimize Clustering Keys",
+          description: "Ensure tables are properly clustered for efficient pruning",
+          sql: "-- Check clustering information for tables\nSELECT \n    TABLE_NAME,\n    CLUSTERING_KEY,\n    TOTAL_BYTES,\n    BYTES_NOT_CLUSTERED,\n    ROUND((BYTES_NOT_CLUSTERED / TOTAL_BYTES) * 100, 2) AS PERCENT_NOT_CLUSTERED\nFROM INFORMATION_SCHEMA.TABLES\nWHERE TABLE_SCHEMA = 'YOUR_SCHEMA'\n    AND CLUSTERING_KEY IS NOT NULL\nORDER BY PERCENT_NOT_CLUSTERED DESC;\n\n-- Check partition pruning effectiveness\nSELECT \n    QUERY_ID,\n    QUERY_TEXT,\n    PARTITIONS_SCANNED,\n    PARTITIONS_TOTAL,\n    ROUND((PARTITIONS_SCANNED / PARTITIONS_TOTAL) * 100, 2) AS PRUNING_PERCENTAGE\nFROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY\nWHERE START_TIME >= DATEADD(day, -1, CURRENT_TIMESTAMP())\n    AND PARTITIONS_TOTAL > 0\nORDER BY PRUNING_PERCENTAGE DESC\nLIMIT 10;",
+          action: "-- Add clustering key to table\nALTER TABLE your_table_name CLUSTER BY (date_column, id_column);\n\n-- Re-cluster table (run periodically)\nALTER TABLE your_table_name RECLUSTER;\n\n-- Check clustering progress\nSELECT SYSTEM$CLUSTERING_INFORMATION('your_table_name');",
+          warning: "⚠️ RECLUSTER consumes credits and can take time on large tables. Run during off-peak hours. Monitor clustering effectiveness before adding clustering keys.",
+          guidance: [
+            "💡 Clustering Key Selection:",
+            "• Choose columns frequently used in WHERE clauses",
+            "• High cardinality columns work best",
+            "• Date/time columns are excellent choices",
+            "• Avoid clustering on low-cardinality columns",
+            "",
+            "💡 Clustering Effectiveness:",
+            "• <10% not clustered = excellent",
+            "• 10-30% not clustered = good",
+            "• >30% not clustered = needs attention",
+            "",
+            "💡 When to Re-cluster:",
+            "• After bulk data loads",
+            "• When clustering effectiveness drops below 80%",
+            "• Before important analytical queries",
+            "",
+            "💡 Partition Pruning:",
+            "• Higher pruning percentage = better performance",
+            "• <50% pruning indicates clustering issues",
+            "• Use EXPLAIN to verify pruning in query plans"
+          ]
+        },
+        {
+          title: "Optimize Data Types and Compression",
+          description: "Ensure efficient data storage and processing",
+          sql: "-- Check table sizes and compression\nSELECT \n    TABLE_NAME,\n    ROW_COUNT,\n    BYTES,\n    ROUND(BYTES / ROW_COUNT, 2) AS BYTES_PER_ROW\nFROM INFORMATION_SCHEMA.TABLES\nWHERE TABLE_SCHEMA = 'YOUR_SCHEMA'\nORDER BY BYTES DESC\nLIMIT 10;\n\n-- Check for inefficient data types\nSELECT \n    COLUMN_NAME,\n    DATA_TYPE,\n    CHARACTER_MAXIMUM_LENGTH,\n    NUMERIC_PRECISION,\n    NUMERIC_SCALE\nFROM INFORMATION_SCHEMA.COLUMNS\nWHERE TABLE_SCHEMA = 'YOUR_SCHEMA'\n    AND DATA_TYPE IN ('VARCHAR', 'CHAR', 'NUMBER')\nORDER BY TABLE_NAME, ORDINAL_POSITION;",
+          action: "-- Optimize VARCHAR columns\nALTER TABLE your_table_name ALTER COLUMN varchar_column SET DATA_TYPE VARCHAR(50);\n\n-- Use appropriate NUMBER precision\nALTER TABLE your_table_name ALTER COLUMN number_column SET DATA_TYPE NUMBER(10,2);\n\n-- Consider using VARIANT for semi-structured data\nALTER TABLE your_table_name ADD COLUMN json_data VARIANT;",
+          guidance: [
+            "💡 Data Type Optimization:",
+            "• Use smallest appropriate VARCHAR size",
+            "• Avoid CHAR unless fixed-length needed",
+            "• Use NUMBER with appropriate precision",
+            "• Consider VARIANT for JSON/semi-structured data",
+            "",
+            "💡 Compression Benefits:",
+            "• Snowflake automatically compresses data",
+            "• Smaller data types = better compression",
+            "• Reduces I/O and improves query performance",
+            "",
+            "💡 Storage Optimization:",
+            "• Monitor BYTES_PER_ROW ratios",
+            "• High ratios may indicate inefficient types",
+            "• Consider partitioning large tables",
+            "",
+            "💡 Best Practices:",
+            "• Use DATE instead of VARCHAR for dates",
+            "• Use TIMESTAMP_NTZ for UTC timestamps",
+            "• Use BOOLEAN instead of VARCHAR('true'/'false')",
+            "• Use ARRAY for repeated values"
+          ]
+        },
+        {
+          title: "Optimize Query Patterns",
+          description: "Rewrite inefficient Snowflake-specific patterns",
+          examples: [
+            { bad: "SELECT * FROM table WHERE DATE(created_at) = '2024-01-01'", good: "SELECT * FROM table WHERE created_at >= '2024-01-01' AND created_at < '2024-01-02'", why: "DATE() function prevents partition pruning; range comparison enables pruning" },
+            { bad: "SELECT COUNT(*) FROM large_table", good: "SELECT COUNT(*) FROM large_table SAMPLE ROW (1000000)", why: "Full table scan is expensive; sampling gives approximate count quickly" },
+            { bad: "SELECT DISTINCT col1, col2 FROM table", good: "SELECT col1, col2 FROM table GROUP BY col1, col2", why: "DISTINCT requires sort; GROUP BY can use clustering keys" },
+            { bad: "WHERE col1 = 'A' OR col2 = 'B'", good: "WHERE col1 = 'A'\nUNION ALL\nSELECT * WHERE col2 = 'B' AND col1 != 'A'", why: "OR prevents partition pruning; UNION allows pruning on each condition" },
+            { bad: "SELECT * FROM table ORDER BY random_column LIMIT 1000", good: "SELECT * FROM table TABLESAMPLE BERNOULLI (1) LIMIT 1000", why: "ORDER BY random_column scans entire table; TABLESAMPLE is much faster" },
+            { bad: "SELECT * FROM table WHERE UPPER(name) = 'JOHN'", good: "SELECT * FROM table WHERE name ILIKE 'john'", why: "UPPER() prevents pruning; ILIKE is case-insensitive and more efficient" },
+            { bad: "SELECT * FROM table WHERE id IN (1,2,3...10000)", good: "CREATE TEMPORARY TABLE temp_ids (id INT);\nINSERT INTO temp_ids VALUES (1),(2),(3);\nSELECT * FROM table JOIN temp_ids ON table.id = temp_ids.id", why: "Large IN lists cause parsing overhead; temp table is more efficient" },
+            { bad: "SELECT * FROM table WHERE col IS NOT NULL", good: "SELECT * FROM table WHERE col > ''", why: "IS NOT NULL can't use clustering; comparison enables pruning" }
+          ],
+          guidance: [
+            "Use range comparisons instead of functions on columns",
+            "Leverage Snowflake's automatic partition pruning",
+            "Use TABLESAMPLE for approximate results",
+            "Prefer UNION over OR for better pruning",
+            "Use ILIKE instead of UPPER()/LOWER() functions",
+            "Consider temporary tables for large IN lists"
+          ]
+        },
+        {
+          title: "Monitor Resource Usage",
+          description: "Track credit consumption and performance metrics",
+          sql: "-- Check credit usage by warehouse\nSELECT \n    WAREHOUSE_NAME,\n    DATE(START_TIME) as usage_date,\n    SUM(CREDITS_USED) as total_credits,\n    AVG(CREDITS_USED) as avg_credits_per_query\nFROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY\nWHERE START_TIME >= DATEADD(day, -7, CURRENT_TIMESTAMP())\nGROUP BY WAREHOUSE_NAME, DATE(START_TIME)\nORDER BY usage_date DESC, total_credits DESC;\n\n-- Check query performance trends\nSELECT \n    DATE(START_TIME) as query_date,\n    COUNT(*) as total_queries,\n    AVG(TOTAL_ELAPSED_TIME) as avg_execution_time_ms,\n    AVG(BYTES_SCANNED) as avg_bytes_scanned,\n    AVG(BYTES_SPILLED_TO_LOCAL_STORAGE) as avg_bytes_spilled\nFROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY\nWHERE START_TIME >= DATEADD(day, -7, CURRENT_TIMESTAMP())\n    AND QUERY_TYPE = 'SELECT'\nGROUP BY DATE(START_TIME)\nORDER BY query_date DESC;\n\n-- Check for expensive queries\nSELECT \n    QUERY_ID,\n    QUERY_TEXT,\n    TOTAL_ELAPSED_TIME,\n    BYTES_SCANNED,\n    CREDITS_USED_CLOUD_SERVICES,\n    START_TIME\nFROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY\nWHERE START_TIME >= DATEADD(day, -1, CURRENT_TIMESTAMP())\n    AND TOTAL_ELAPSED_TIME > 30000  -- >30 seconds\nORDER BY TOTAL_ELAPSED_TIME DESC\nLIMIT 10;",
+          action: "-- Set up query monitoring\nALTER SESSION SET QUERY_TAG = 'performance_monitoring';\n\n-- Use result caching for repeated queries\nALTER SESSION SET USE_CACHED_RESULT = TRUE;\n\n-- Enable query result caching\nALTER SESSION SET QUERY_RESULT_FORMAT = 'JSON';",
+          guidance: [
+            "💡 Credit Optimization:",
+            "• Monitor credit usage patterns",
+            "• Use auto-suspend for idle warehouses",
+            "• Consider result caching for repeated queries",
+            "• Optimize queries before scaling warehouses",
+            "",
+            "💡 Performance Monitoring:",
+            "• Track average execution times",
+            "• Monitor bytes scanned vs spilled",
+            "• Identify expensive queries regularly",
+            "• Use query tags for tracking",
+            "",
+            "💡 Cost Management:",
+            "• Set up billing alerts",
+            "• Review credit usage weekly",
+            "• Optimize before scaling up",
+            "• Use Account Usage views for insights",
+            "",
+            "💡 Best Practices:",
+            "• Cache frequently accessed results",
+            "• Use appropriate warehouse sizes",
+            "• Monitor and optimize continuously",
+            "• Set up automated monitoring alerts"
+          ]
+        },
+        {
+          title: "Using CTEs and Window Functions Effectively",
+          description: "Leverage Snowflake's advanced SQL features",
+          examples: [
+            { bad: "SELECT o.*,\n  (SELECT SUM(amount) FROM order_items WHERE order_id = o.id) as total,\n  (SELECT COUNT(*) FROM order_items WHERE order_id = o.id) as item_count\nFROM orders o", good: "WITH order_totals AS (\n  SELECT order_id,\n    SUM(amount) as total,\n    COUNT(*) as item_count\n  FROM order_items\n  GROUP BY order_id\n)\nSELECT o.*, ot.total, ot.item_count\nFROM orders o\nLEFT JOIN order_totals ot ON o.id = ot.order_id", why: "Correlated subqueries execute per row; CTE aggregates once then joins" },
+            { bad: "SELECT * FROM (\n  SELECT *, ROW_NUMBER() OVER (ORDER BY created_at DESC) as rn\n  FROM orders\n) WHERE rn <= 10", good: "SELECT * FROM orders\nQUALIFY ROW_NUMBER() OVER (ORDER BY created_at DESC) <= 10", why: "QUALIFY is Snowflake-specific and more efficient than subquery" },
+            { bad: "SELECT customer_id, order_date, amount\nFROM orders\nWHERE order_date >= '2024-01-01'\nORDER BY customer_id, order_date", good: "SELECT customer_id, order_date, amount,\n  LAG(amount) OVER (PARTITION BY customer_id ORDER BY order_date) as prev_amount\nFROM orders\nWHERE order_date >= '2024-01-01'\nQUALIFY ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY order_date) <= 5", why: "Window functions provide more analytical power and QUALIFY filters efficiently" }
+          ],
+          guidance: [
+            "✅ Use CTEs for: Complex multi-step transformations, recursive queries, improving readability",
+            "✅ Use QUALIFY instead of subqueries for filtering window function results",
+            "✅ Leverage Snowflake's advanced window functions (LAG, LEAD, QUALIFY)",
+            "✅ Use window functions for analytical queries instead of self-joins",
+            "❌ Avoid CTEs when: Simple single-use subqueries, adding unnecessary complexity",
+            "💡 Tip: Snowflake's QUALIFY clause is more efficient than subqueries for window function filtering"
+          ]
+        }
       ]
     };
     return allSteps[dbType] || [];
@@ -610,11 +796,11 @@ const DBTroubleshooter = () => {
         </div>
         <div className="mb-6">
           <label className="block text-sm font-medium mb-2">Select Your Database Type:</label>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            {['postgresql', 'mysql', 'sqlserver', 'oracle'].map((db) => (
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+            {['postgresql', 'mysql', 'sqlserver', 'oracle', 'snowflake'].map((db) => (
               <button key={db} onClick={() => setDbType(db)} className="p-6 border-2 border-gray-200 rounded-lg hover:border-blue-500 hover:bg-blue-50 transition-all">
                 <Database className="w-8 h-8 mx-auto mb-2 text-blue-600" />
-                <div className="font-semibold capitalize">{db === 'sqlserver' ? 'SQL Server' : db === 'postgresql' ? 'PostgreSQL' : db === 'oracle' ? 'Oracle' : 'MySQL'}</div>
+                <div className="font-semibold capitalize">{db === 'sqlserver' ? 'SQL Server' : db === 'postgresql' ? 'PostgreSQL' : db === 'oracle' ? 'Oracle' : db === 'snowflake' ? 'Snowflake' : 'MySQL'}</div>
               </button>
             ))}
           </div>
@@ -628,7 +814,7 @@ const DBTroubleshooter = () => {
       <div className="mb-6 flex items-center justify-between">
         <div>
           <button onClick={() => { setDbType(''); setCurrentStep(0); setFindings({}); }} className="text-sm text-blue-600 hover:text-blue-800 mb-2">← Change Database</button>
-          <h1 className="text-2xl font-bold">{dbType === 'sqlserver' ? 'SQL Server' : dbType === 'postgresql' ? 'PostgreSQL' : dbType === 'oracle' ? 'Oracle' : 'MySQL'} Troubleshooting</h1>
+          <h1 className="text-2xl font-bold">{dbType === 'sqlserver' ? 'SQL Server' : dbType === 'postgresql' ? 'PostgreSQL' : dbType === 'oracle' ? 'Oracle' : dbType === 'snowflake' ? 'Snowflake' : 'MySQL'} Troubleshooting</h1>
         </div>
         <div className="text-sm text-gray-600">Step {currentStep + 1} of {steps.length}</div>
       </div>
