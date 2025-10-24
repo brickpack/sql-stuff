@@ -12,7 +12,7 @@ An interactive React application that helps developers diagnose and fix slow dat
 
 ## Live Demo
 
-🌐 **[View Live Application](https://yourusername.github.io/sql-stuff/)**
+🌐 **[View Live Application](https://brickpack.github.io/sql-stuff/)**
 
 ## Local Development
 
