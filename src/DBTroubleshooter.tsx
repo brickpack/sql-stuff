@@ -303,6 +303,53 @@ const DBTroubleshooter = () => {
       ],
       postgresql: [
         {
+          title: "Find Slow Queries (pg_stat_statements)",
+          description: "Identify top offenders by total time, average time, and variance",
+          sql: "-- Enable extension if not already (do once)\nCREATE EXTENSION IF NOT EXISTS pg_stat_statements;\n\n-- Top queries by total time (most optimization leverage)\nSELECT query,\n       calls,\n       ROUND(total_exec_time::numeric, 2) AS total_ms,\n       ROUND(mean_exec_time::numeric, 2)  AS avg_ms,\n       ROUND(stddev_exec_time::numeric, 2) AS stddev_ms,\n       ROUND((total_exec_time / SUM(total_exec_time) OVER()) * 100, 2) AS pct_total\nFROM pg_stat_statements\nORDER BY total_exec_time DESC\nLIMIT 20;\n\n-- Queries with high variance (inconsistent performance - sniffing / plan instability)\nSELECT query,\n       calls,\n       ROUND(mean_exec_time::numeric, 2)   AS avg_ms,\n       ROUND(stddev_exec_time::numeric, 2)  AS stddev_ms,\n       ROUND((stddev_exec_time / NULLIF(mean_exec_time, 0))::numeric, 2) AS cv\nFROM pg_stat_statements\nWHERE calls > 10\nORDER BY cv DESC\nLIMIT 20;\n\n-- Reset stats after optimizing (start fresh)\nSELECT pg_stat_statements_reset();",
+          guidance: [
+            "total_exec_time: Best starting point — highest total time = most optimization leverage",
+            "High stddev relative to mean (cv > 1) = plan instability or parameter sensitivity",
+            "High calls + low avg_ms = frequent lightweight query; even small savings compound",
+            "pg_stat_statements requires track_activity_query_size to be set large enough to capture full queries",
+            "On RDS/Aurora: enable via Parameter Group with shared_preload_libraries = pg_stat_statements",
+            "Reset stats after significant changes to get clean before/after comparison"
+          ]
+        },
+        {
+          title: "Aurora Performance Insights",
+          description: "Identify DB load by wait event, top SQL, and top hosts (Aurora / RDS)",
+          action: "# Enable Performance Insights (if not already)\n# RDS Console: Modify instance → Performance Insights → Enable\n# Or via CLI:\naws rds modify-db-instance \\\n  --db-instance-identifier my-db \\\n  --enable-performance-insights \\\n  --performance-insights-retention-period 7\n\n# Query Performance Insights via CLI\n# Get DB load by wait event (last 1 hour)\naws pi get-resource-metrics \\\n  --service-type RDS \\\n  --identifier db:my-db-instance-id \\\n  --metric-queries '[{\"Metric\": \"db.load.avg\", \"GroupBy\": {\"Group\": \"db.wait_event\", \"Limit\": 10}}]' \\\n  --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ) \\\n  --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \\\n  --period-in-seconds 60\n\n# Get top SQL by DB load\naws pi get-resource-metrics \\\n  --service-type RDS \\\n  --identifier db:my-db-instance-id \\\n  --metric-queries '[{\"Metric\": \"db.load.avg\", \"GroupBy\": {\"Group\": \"db.sql\", \"Limit\": 10}}]' \\\n  --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ) \\\n  --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \\\n  --period-in-seconds 60",
+          guidance: [
+            "💡 DB Load (AAS - Average Active Sessions):",
+            "AAS > number of vCPUs = system is CPU-saturated or waiting",
+            "Use the wait event breakdown to see what sessions are waiting on",
+            "",
+            "💡 Key Wait Event Types:",
+            "CPU: Queries are compute-bound (optimize query, add indexes, scale instance)",
+            "IO:DataFileRead: Reading data pages from storage (missing indexes, large scans)",
+            "IO:WALWrite: Write-heavy workload (batch writes, high UPDATE/DELETE rate)",
+            "Lock:relation / Lock:tuple: Lock contention (see Blocking step)",
+            "Client:ClientRead: App is slow reading results (network, large result sets)",
+            "BufferPin: Hot blocks being accessed by many sessions concurrently",
+            "",
+            "💡 Workflow:",
+            "Start here before EXPLAIN ANALYZE — PI shows you which queries to investigate",
+            "Correlate spikes in DB load with application deployment times or cron jobs",
+            "Top SQL tab shows digest queries normalized for easy comparison across executions",
+            "",
+            "💡 Aurora-Specific:",
+            "Performance Insights is free for 7 days retention on Aurora; longer retention is paid",
+            "Aurora Serverless v2 supports Performance Insights from engine 13.6+ / 14.3+",
+            "Use 'Top hosts' to identify which application server or Lambda is driving load"
+          ],
+          checks: [
+            { label: "DB load consistently > vCPU count?", key: "highDBLoad", advice: "System is saturated. Check top wait events to determine if CPU-bound (scale up instance class) or I/O-bound (add indexes, increase Aurora storage I/O). DB load > 2× vCPUs is a serious bottleneck." },
+            { label: "IO:DataFileRead is top wait event?", key: "dataFileRead", advice: "Queries are reading pages from Aurora storage. Add indexes to eliminate full table scans. Check shared_buffers — if buffer cache hit rate is low, consider scaling to an instance class with more RAM." },
+            { label: "Lock waits prominent in wait events?", key: "piLockWaits", advice: "Follow the Identify Blocking step to find the blocking queries. Performance Insights will show you which SQL digest is the blocker vs the blocked session." },
+            { label: "CPU is top wait event?", key: "cpuBound", advice: "Queries are compute-bound. Identify the top SQL in Performance Insights, run EXPLAIN ANALYZE, and look for large seq scans or hash joins processing too many rows. Consider a larger instance class if query optimization is exhausted." }
+          ]
+        },
+        {
           title: "Get Execution Plan with Full Details",
           description: "Run EXPLAIN ANALYZE to see actual execution statistics",
           sql: "EXPLAIN (ANALYZE, BUFFERS, VERBOSE)\nyour_query_here;",
@@ -348,6 +395,25 @@ const DBTroubleshooter = () => {
           ]
         },
         {
+          title: "Index Health: Unused and Bloated Indexes",
+          description: "Find indexes wasting write overhead and indexes needing rebuild",
+          sql: "-- Unused indexes (never scanned since last stats reset)\nSELECT schemaname, relname AS table_name, indexrelname AS index_name,\n       pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,\n       idx_scan, idx_tup_read, idx_tup_fetch\nFROM pg_stat_user_indexes\nWHERE idx_scan = 0\n  AND schemaname NOT IN ('pg_catalog', 'information_schema')\nORDER BY pg_relation_size(indexrelid) DESC;\n\n-- Bloated indexes (index much larger than table warrants)\nSELECT schemaname, relname AS table_name, indexrelname AS index_name,\n       pg_size_pretty(pg_relation_size(indexrelid))  AS index_size,\n       pg_size_pretty(pg_relation_size(relid))       AS table_size,\n       ROUND(100.0 * pg_relation_size(indexrelid)\n             / NULLIF(pg_relation_size(relid), 0), 1) AS index_pct_of_table\nFROM pg_stat_user_indexes\nJOIN pg_index USING (indexrelid)\nWHERE NOT indisprimary\n  AND schemaname NOT IN ('pg_catalog', 'information_schema')\nORDER BY pg_relation_size(indexrelid) DESC\nLIMIT 20;\n\n-- Duplicate / redundant indexes (same leading column)\nSELECT indrelid::regclass AS table_name,\n       array_agg(indexrelid::regclass) AS indexes,\n       array_agg(indkey) AS index_keys\nFROM pg_index\nGROUP BY indrelid, indkey\nHAVING COUNT(*) > 1;",
+          action: "-- Rebuild a bloated index without locking (PostgreSQL 12+)\nREINDEX INDEX CONCURRENTLY idx_name;\n\n-- Drop an unused index (verify it's truly unused first!)\nDROP INDEX CONCURRENTLY idx_name;",
+          warning: "⚠️ idx_scan = 0 only means the index hasn't been used since the last pg_stat_reset(). If stats were recently reset, or the instance restarted, an index may appear unused falsely. Cross-check with pgBadger or CloudWatch logs before dropping.",
+          guidance: [
+            "Unused indexes still incur write overhead on every INSERT/UPDATE/DELETE — they slow writes for zero read benefit",
+            "Index bloat > 200% of table size often warrants REINDEX CONCURRENTLY",
+            "Duplicate indexes with identical leading columns are pure overhead — keep the wider one",
+            "On Aurora read replicas, indexes are replicated — unused indexes on the writer waste replica I/O too",
+            "After dropping unused indexes, monitor for a week before declaring success"
+          ],
+          checks: [
+            { label: "Indexes with idx_scan = 0?", key: "unusedIndexes", advice: "Confirm the index is genuinely unused (check uptime and last stats reset). If confirmed, drop with DROP INDEX CONCURRENTLY. Large unused indexes on high-write tables are a significant write tax." },
+            { label: "Index size >> table size?", key: "bloatedIndex", advice: "Run REINDEX INDEX CONCURRENTLY to rebuild without locking. Bloat typically accumulates on high-churn tables. Also check for autovacuum not keeping up (see Autovacuum step)." },
+            { label: "Duplicate indexes found?", key: "duplicateIndexes", advice: "Keep the index with more INCLUDE columns or the one used by a constraint. Drop the narrower duplicate with DROP INDEX CONCURRENTLY. Two indexes on (col_a) and (col_a, col_b) — the first is redundant for queries the second covers." }
+          ]
+        },
+        {
           title: "Analyze Join Performance",
           description: "Check if join methods are optimal",
           sql: "SET enable_nestloop = off;\nEXPLAIN (ANALYZE, BUFFERS) your_query_here;\nRESET enable_nestloop;",
@@ -362,6 +428,41 @@ const DBTroubleshooter = () => {
             { label: "Nested Loop with high loop count (>1000)?", key: "highLoops", advice: "Add index on inner table join column. High loops mean scanning inner table repeatedly. CREATE INDEX CONCURRENTLY idx ON inner(join_key). Consider forcing hash join for testing." },
             { label: "Hash join with multiple batches?", key: "hashBatches", advice: "Increase work_mem to fit hash table: SET work_mem = '512MB'. Multiple batches = spilling to disk. Check plan output for 'Batches: X' where X > 1." },
             { label: "Join producing way more rows than expected?", key: "joinExplosion", advice: "Check for cartesian product (missing join condition). Review JOIN conditions for correctness. Run ANALYZE to update statistics. Consider adding WHERE filters earlier in query." }
+          ]
+        },
+        {
+          title: "Optimize Patterns",
+          description: "Rewrite inefficient queries",
+          examples: [
+            { bad: "WHERE customer_id IN (SELECT...)", good: "JOIN customers c ON o.customer_id = c.id", why: "IN with subquery can't short-circuit; JOIN allows better optimization" },
+            { bad: "WHERE DATE(created_at) = '2024-01-01'", good: "WHERE created_at >= '2024-01-01'\n  AND created_at < '2024-01-02'", why: "Function on column prevents index usage; range allows index seek" },
+            { bad: "SELECT COUNT(*) FROM large_table\nWHERE status = 'active'", good: "SELECT reltuples::bigint\nFROM pg_class\nWHERE relname = 'large_table'", why: "Exact count scans entire table; approximate is instant from stats" },
+            { bad: "SELECT DISTINCT column FROM table", good: "SELECT column FROM table\nGROUP BY column", why: "DISTINCT requires sort; GROUP BY can use indexes more efficiently" },
+            { bad: "WHERE LOWER(email) = 'user@example.com'", good: "CREATE INDEX idx ON table(LOWER(email));\nWHERE LOWER(email) = 'user@example.com'", why: "Function prevents normal index use; expression index solves this" },
+            { bad: "WHERE UPPER(name) = 'JOHN'", good: "WHERE name ILIKE 'john'", why: "UPPER() prevents index usage; ILIKE is case-insensitive and more efficient" },
+            { bad: "SELECT * FROM orders\nWHERE amount > 1000 OR status = 'urgent'", good: "SELECT * FROM orders WHERE amount > 1000\nUNION\nSELECT * FROM orders WHERE status = 'urgent'", why: "OR prevents using multiple indexes; UNION allows index on each condition" }
+          ],
+          guidance: [
+            "Replace IN with JOINs",
+            "Avoid functions on indexed columns",
+            "Use EXISTS instead of IN for large subqueries",
+            "Create expression indexes for functions in WHERE clause",
+            "Use ILIKE instead of UPPER()/LOWER() for case-insensitive searches"
+          ]
+        },
+        {
+          title: "Using CTEs Effectively",
+          description: "When to use Common Table Expressions",
+          examples: [
+            { bad: "SELECT o.*, \n  (SELECT SUM(amount) FROM order_items WHERE order_id = o.id) as total,\n  (SELECT COUNT(*) FROM order_items WHERE order_id = o.id) as item_count\nFROM orders o", good: "WITH order_totals AS (\n  SELECT order_id,\n    SUM(amount) as total,\n    COUNT(*) as item_count\n  FROM order_items\n  GROUP BY order_id\n)\nSELECT o.*, ot.total, ot.item_count\nFROM orders o\nJOIN order_totals ot ON o.id = ot.order_id", why: "Multiple correlated subqueries scan repeatedly; CTE scans once and joins" },
+            { bad: "SELECT * FROM (\n  SELECT * FROM (\n    SELECT ... FROM table\n    WHERE ...\n  ) sub1\n  WHERE ...\n) sub2", good: "WITH step1 AS (\n  SELECT ... FROM table WHERE ...\n),\nstep2 AS (\n  SELECT ... FROM step1 WHERE ...\n)\nSELECT * FROM step2", why: "Nested subqueries are hard to read; CTEs provide clear logical steps" }
+          ],
+          guidance: [
+            "✅ Use CTEs for: Improving readability, avoiding repeated subqueries, breaking complex logic into steps",
+            "✅ Use CTEs when: Same subquery used multiple times, recursive queries needed, complex multi-step transformations",
+            "❌ Avoid CTEs when: Simple queries (adds overhead), results could be a view, single-use subquery is simpler",
+            "⚠️ Note: PostgreSQL doesn't always optimize CTEs away - consider MATERIALIZED or NOT MATERIALIZED hints",
+            "💡 Tip: Use CTEs for development/readability, then optimize hotspots if needed"
           ]
         },
         {
@@ -403,47 +504,87 @@ const DBTroubleshooter = () => {
           ]
         },
         {
-          title: "Optimize Patterns",
-          description: "Rewrite inefficient queries",
-          examples: [
-            { bad: "WHERE customer_id IN (SELECT...)", good: "JOIN customers c ON o.customer_id = c.id", why: "IN with subquery can't short-circuit; JOIN allows better optimization" },
-            { bad: "WHERE DATE(created_at) = '2024-01-01'", good: "WHERE created_at >= '2024-01-01'\n  AND created_at < '2024-01-02'", why: "Function on column prevents index usage; range allows index seek" },
-            { bad: "SELECT COUNT(*) FROM large_table\nWHERE status = 'active'", good: "SELECT reltuples::bigint\nFROM pg_class\nWHERE relname = 'large_table'", why: "Exact count scans entire table; approximate is instant from stats" },
-            { bad: "SELECT DISTINCT column FROM table", good: "SELECT column FROM table\nGROUP BY column", why: "DISTINCT requires sort; GROUP BY can use indexes more efficiently" },
-            { bad: "WHERE LOWER(email) = 'user@example.com'", good: "CREATE INDEX idx ON table(LOWER(email));\nWHERE LOWER(email) = 'user@example.com'", why: "Function prevents normal index use; expression index solves this" },
-            { bad: "WHERE UPPER(name) = 'JOHN'", good: "WHERE name ILIKE 'john'", why: "UPPER() prevents index usage; ILIKE is case-insensitive and more efficient" },
-            { bad: "SELECT * FROM orders\nWHERE amount > 1000 OR status = 'urgent'", good: "SELECT * FROM orders WHERE amount > 1000\nUNION\nSELECT * FROM orders WHERE status = 'urgent'", why: "OR prevents using multiple indexes; UNION allows index on each condition" }
-          ],
+          title: "Identify Blocking and Lock Contention",
+          description: "Find queries blocking others and lock conflicts",
+          sql: "-- Find blocking queries\nSELECT \n    blocked_locks.pid AS blocked_pid,\n    blocked_activity.usename AS blocked_user,\n    blocking_locks.pid AS blocking_pid,\n    blocking_activity.usename AS blocking_user,\n    blocked_activity.query AS blocked_query,\n    blocking_activity.query AS blocking_query,\n    blocked_activity.application_name AS blocked_app,\n    blocking_activity.application_name AS blocking_app,\n    now() - blocked_activity.query_start AS blocked_duration\nFROM pg_catalog.pg_locks blocked_locks\nJOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid\nJOIN pg_catalog.pg_locks blocking_locks \n    ON blocking_locks.locktype = blocked_locks.locktype\n    AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database\n    AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation\n    AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page\n    AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple\n    AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid\n    AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid\n    AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid\n    AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid\n    AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid\n    AND blocking_locks.pid != blocked_locks.pid\nJOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_activity.pid = blocking_locks.pid\nWHERE NOT blocked_locks.granted\nORDER BY blocked_activity.query_start;\n\n-- View all locks by type\nSELECT \n    locktype,\n    relation::regclass AS table_name,\n    mode,\n    COUNT(*) AS lock_count,\n    ARRAY_AGG(DISTINCT pid) AS pids\nFROM pg_locks\nWHERE relation IS NOT NULL\nGROUP BY locktype, relation, mode\nORDER BY lock_count DESC;\n\n-- Check for lock waits\nSELECT \n    pid,\n    usename,\n    wait_event_type,\n    wait_event,\n    state,\n    query,\n    now() - query_start AS duration\nFROM pg_stat_activity\nWHERE wait_event IS NOT NULL\n    AND state = 'active'\nORDER BY query_start\nLIMIT 20;",
+          action: "-- Terminate blocking query (use carefully!)\nSELECT pg_terminate_backend(blocking_pid);\n\n-- Cancel query without terminating connection\nSELECT pg_cancel_backend(pid);\n\n-- Set lock timeout to prevent indefinite waits\nSET lock_timeout = '5s';\n\n-- Set statement timeout\nSET statement_timeout = '30s';\n\n-- Use explicit locking when needed\nBEGIN;\nLOCK TABLE table_name IN ACCESS EXCLUSIVE MODE;\n-- Your operations here\nCOMMIT;",
+          warning: "⚠️ Terminating or canceling queries will abort transactions and may cause application errors. Only use when necessary. Lock timeouts will cause queries to fail if locks can't be acquired.",
           guidance: [
-            "Replace IN with JOINs",
-            "Avoid functions on indexed columns",
-            "Use EXISTS instead of IN for large subqueries",
-            "Create expression indexes for functions in WHERE clause",
-            "Use ILIKE instead of UPPER()/LOWER() for case-insensitive searches"
+            "💡 Understanding Locks:",
+            "PostgreSQL uses MVCC for most reads (no locks needed)",
+            "Locks occur during writes, DDL operations, and explicit LOCK commands",
+            "blocked_locks.granted = false means query is waiting for a lock",
+            "Long-running transactions hold locks longer",
+            "",
+            "💡 Lock Modes (least to most restrictive):",
+            "ACCESS SHARE: SELECT (doesn't conflict with most operations)",
+            "ROW SHARE: SELECT FOR UPDATE",
+            "ROW EXCLUSIVE: INSERT, UPDATE, DELETE",
+            "SHARE UPDATE EXCLUSIVE: VACUUM, CREATE INDEX CONCURRENTLY",
+            "SHARE: CREATE INDEX (locks out writes)",
+            "EXCLUSIVE: Refresh materialized views",
+            "ACCESS EXCLUSIVE: DDL operations (ALTER, DROP, TRUNCATE, VACUUM FULL)",
+            "",
+            "💡 Common Blocking Scenarios:",
+            "Long UPDATE/DELETE blocking other writes to same rows",
+            "ALTER TABLE blocking all access to table",
+            "CREATE INDEX (without CONCURRENTLY) blocking writes",
+            "VACUUM FULL blocking all access",
+            "Explicit LOCK TABLE commands",
+            "",
+            "💡 Reducing Lock Contention:",
+            "Keep transactions short and fast",
+            "Use CREATE INDEX CONCURRENTLY for index creation",
+            "Avoid LOCK TABLE unless absolutely necessary",
+            "Use smaller batches for large UPDATE/DELETE operations",
+            "Consider partitioning to reduce lock scope",
+            "Run DDL during maintenance windows",
+            "",
+            "💡 Wait Events:",
+            "Lock wait events indicate lock contention",
+            "LWLock = lightweight lock (internal PostgreSQL structures)",
+            "Common: BufferPin, LockManager, WALWrite",
+            "Monitor wait_event_type and wait_event columns",
+            "",
+            "📊 Monitor: pg_locks, pg_stat_activity (wait_event columns)"
+          ],
+          checks: [
+            { label: "Queries blocked > 30 seconds?", key: "longBlocking", advice: "Find blocking query in pg_stat_activity. Optimize or kill blocking session: SELECT pg_terminate_backend(blocking_pid). Add indexes to speed up blocking query. Shorten transaction durations." },
+            { label: "ACCESS EXCLUSIVE locks on busy tables?", key: "exclusiveLocks", advice: "ACCESS EXCLUSIVE locks block all access. Use CREATE INDEX CONCURRENTLY instead of CREATE INDEX. Schedule DDL (ALTER TABLE, VACUUM FULL) during maintenance windows. Avoid LOCK TABLE commands on production tables." },
+            { label: "Many lock waits in pg_stat_activity?", key: "lockWaits", advice: "Check wait_event and wait_event_type columns. Common: Lock (row locks), Extend (table extension). Add indexes to reduce scan times. Keep transactions short. Use lock_timeout to prevent indefinite waits: SET lock_timeout = '5s'." },
+            { label: "DDL operations during peak hours?", key: "peakDDL", advice: "Schedule DDL operations (ALTER TABLE, DROP, etc.) during maintenance windows. Use CONCURRENTLY option when available (CREATE INDEX CONCURRENTLY). Test DDL duration in non-prod first to estimate impact." },
+            { label: "No lock_timeout configured?", key: "noLockTimeout", advice: "Set lock_timeout to prevent queries from waiting indefinitely: ALTER SYSTEM SET lock_timeout = '30s'. Or per-session: SET lock_timeout = '10s'. This prevents pile-ups when locks are held too long." }
           ]
         },
         {
-          title: "Using CTEs Effectively",
-          description: "When to use Common Table Expressions",
-          examples: [
-            { bad: "SELECT o.*, \n  (SELECT SUM(amount) FROM order_items WHERE order_id = o.id) as total,\n  (SELECT COUNT(*) FROM order_items WHERE order_id = o.id) as item_count\nFROM orders o", good: "WITH order_totals AS (\n  SELECT order_id,\n    SUM(amount) as total,\n    COUNT(*) as item_count\n  FROM order_items\n  GROUP BY order_id\n)\nSELECT o.*, ot.total, ot.item_count\nFROM orders o\nJOIN order_totals ot ON o.id = ot.order_id", why: "Multiple correlated subqueries scan repeatedly; CTE scans once and joins" },
-            { bad: "SELECT * FROM (\n  SELECT * FROM (\n    SELECT ... FROM table\n    WHERE ...\n  ) sub1\n  WHERE ...\n) sub2", good: "WITH step1 AS (\n  SELECT ... FROM table WHERE ...\n),\nstep2 AS (\n  SELECT ... FROM step1 WHERE ...\n)\nSELECT * FROM step2", why: "Nested subqueries are hard to read; CTEs provide clear logical steps" }
+          title: "Analyze Wait Events",
+          description: "Understand what active queries are waiting on",
+          sql: "-- Current wait events for active sessions\nSELECT pid,\n       wait_event_type,\n       wait_event,\n       state,\n       ROUND(EXTRACT(EPOCH FROM (now() - query_start))::numeric, 2) AS query_secs,\n       LEFT(query, 80) AS query_snippet\nFROM pg_stat_activity\nWHERE state <> 'idle'\n  AND pid <> pg_backend_pid()\nORDER BY query_secs DESC;\n\n-- Aggregate wait events over time (sample every second for 10s)\n-- Run this as a quick snapshot loop from psql or a monitoring script:\n-- for i in $(seq 10); do psql -c \"SELECT wait_event_type, wait_event, count(*) FROM pg_stat_activity WHERE state='active' GROUP BY 1,2 ORDER BY 3 DESC;\"; sleep 1; done\n\n-- Historical waits via pg_stat_statements (I/O time breakdown)\nSELECT query,\n       calls,\n       ROUND(mean_exec_time::numeric, 2)      AS avg_total_ms,\n       ROUND((blk_read_time/NULLIF(calls,0))::numeric, 2) AS avg_disk_read_ms,\n       ROUND((blk_write_time/NULLIF(calls,0))::numeric, 2) AS avg_disk_write_ms\nFROM pg_stat_statements\nWHERE blk_read_time + blk_write_time > 0\nORDER BY blk_read_time + blk_write_time DESC\nLIMIT 20;",
+          guidance: [
+            "💡 wait_event_type categories:",
+            "NULL (no wait): Session is on CPU — CPU-bound query",
+            "IO: Waiting on storage reads/writes (DataFileRead = missing index or cold cache)",
+            "Lock: Waiting for a row/table/advisory lock (see Blocking step)",
+            "LWLock: Internal PostgreSQL structure contention (BufferMapping, WALWrite, etc.)",
+            "Client: Waiting for the application to read results (slow app / large result set)",
+            "IPC: Inter-process communication (BgWorker, replication)",
+            "",
+            "💡 Using pg_stat_statements for I/O breakdown:",
+            "blk_read_time and blk_write_time require track_io_timing = on in Parameter Group",
+            "High blk_read_time / calls = query is I/O-bound, not CPU-bound",
+            "On Aurora, blk_read_time reflects Aurora storage reads (network I/O to storage layer)",
+            "",
+            "💡 Quick diagnosis workflow:",
+            "Many sessions on IO:DataFileRead → missing indexes or buffer cache too small",
+            "Many sessions on Lock → follow the Blocking step",
+            "Many sessions on CPU (no wait) → query needs optimization or instance needs scaling",
+            "Many sessions on Client:ClientRead → reduce result set size, check app network"
           ],
-          guidance: [
-            "✅ Use CTEs for: Improving readability, avoiding repeated subqueries, breaking complex logic into steps",
-            "✅ Use CTEs when: Same subquery used multiple times, recursive queries needed, complex multi-step transformations",
-            "❌ Avoid CTEs when: Simple queries (adds overhead), results could be a view, single-use subquery is simpler",
-            "⚠️ Note: PostgreSQL doesn't always optimize CTEs away - consider MATERIALIZED or NOT MATERIALIZED hints",
-            "💡 Tip: Use CTEs for development/readability, then optimize hotspots if needed"
-          ]
-        },
-        {
-          title: "Monitor Production",
-          description: "Track slow queries",
-          sql: "SELECT query, calls, mean_exec_time\nFROM pg_stat_statements\nORDER BY mean_exec_time DESC\nLIMIT 10;",
-          guidance: [
-            "Use pg_stat_statements extension",
-            "Track performance over time"
+          checks: [
+            { label: "IO:DataFileRead is most common wait?", key: "dataFileReadWait", advice: "Queries are reading pages from disk. Add indexes to eliminate sequential scans. Check buffer cache hit rate in pg_stat_bgwriter. On Aurora, consider scaling to a memory-optimized instance class." },
+            { label: "High blk_read_time in pg_stat_statements?", key: "highBlkReadTime", advice: "Enable track_io_timing = on to get accurate I/O data. Queries with high avg_disk_read_ms are I/O-bound — prioritize these for index optimization over CPU-bound queries." },
+            { label: "Many sessions waiting with no wait_event (CPU)?", key: "cpuWaits", advice: "System is CPU-saturated. Find the top CPU queries in pg_stat_statements by total_exec_time. Look for large seq scans, hash joins processing millions of rows, or missing indexes causing repeated full scans." },
+            { label: "LWLock:BufferMapping or LWLock:WALWrite frequent?", key: "lwlocks", advice: "BufferMapping contention: increase shared_buffers or reduce concurrency on hot tables. WALWrite contention on high-write workloads: tune wal_buffers, checkpoint settings, or consider separating write-heavy tables." }
           ]
         },
         {
@@ -561,56 +702,93 @@ const DBTroubleshooter = () => {
           ]
         },
         {
-          title: "Identify Blocking and Lock Contention",
-          description: "Find queries blocking others and lock conflicts",
-          sql: "-- Find blocking queries\nSELECT \n    blocked_locks.pid AS blocked_pid,\n    blocked_activity.usename AS blocked_user,\n    blocking_locks.pid AS blocking_pid,\n    blocking_activity.usename AS blocking_user,\n    blocked_activity.query AS blocked_query,\n    blocking_activity.query AS blocking_query,\n    blocked_activity.application_name AS blocked_app,\n    blocking_activity.application_name AS blocking_app,\n    now() - blocked_activity.query_start AS blocked_duration\nFROM pg_catalog.pg_locks blocked_locks\nJOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid\nJOIN pg_catalog.pg_locks blocking_locks \n    ON blocking_locks.locktype = blocked_locks.locktype\n    AND blocking_locks.database IS NOT DISTINCT FROM blocked_locks.database\n    AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation\n    AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page\n    AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple\n    AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid\n    AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid\n    AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid\n    AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid\n    AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid\n    AND blocking_locks.pid != blocked_locks.pid\nJOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_activity.pid = blocking_locks.pid\nWHERE NOT blocked_locks.granted\nORDER BY blocked_activity.query_start;\n\n-- View all locks by type\nSELECT \n    locktype,\n    relation::regclass AS table_name,\n    mode,\n    COUNT(*) AS lock_count,\n    ARRAY_AGG(DISTINCT pid) AS pids\nFROM pg_locks\nWHERE relation IS NOT NULL\nGROUP BY locktype, relation, mode\nORDER BY lock_count DESC;\n\n-- Check for lock waits\nSELECT \n    pid,\n    usename,\n    wait_event_type,\n    wait_event,\n    state,\n    query,\n    now() - query_start AS duration\nFROM pg_stat_activity\nWHERE wait_event IS NOT NULL\n    AND state = 'active'\nORDER BY query_start\nLIMIT 20;",
-          action: "-- Terminate blocking query (use carefully!)\nSELECT pg_terminate_backend(blocking_pid);\n\n-- Cancel query without terminating connection\nSELECT pg_cancel_backend(pid);\n\n-- Set lock timeout to prevent indefinite waits\nSET lock_timeout = '5s';\n\n-- Set statement timeout\nSET statement_timeout = '30s';\n\n-- Use explicit locking when needed\nBEGIN;\nLOCK TABLE table_name IN ACCESS EXCLUSIVE MODE;\n-- Your operations here\nCOMMIT;",
-          warning: "⚠️ Terminating or canceling queries will abort transactions and may cause application errors. Only use when necessary. Lock timeouts will cause queries to fail if locks can't be acquired.",
+          title: "Query CloudWatch Logs (Aurora / RDS)",
+          description: "Find slow queries and errors using CloudWatch Logs Insights",
+          sql: "-- CloudWatch Logs Insights queries (run in AWS Console or CLI)\n-- Log group: /aws/rds/instance/<db-identifier>/postgresql\n--         or /aws/rds/cluster/<cluster-identifier>/postgresql\n\n-- Find slowest queries in the last hour\nfields @timestamp, @message\n| filter @message like /duration:/\n| parse @message \"duration: * ms  statement: *\" as duration_ms, statement\n| filter ispresent(duration_ms)\n| sort duration_ms desc\n| limit 50\n\n-- Find queries over 1 second\nfields @timestamp, @message\n| filter @message like /duration:/\n| parse @message \"duration: * ms  statement: *\" as duration_ms, statement\n| filter duration_ms > 1000\n| sort duration_ms desc\n| limit 100\n\n-- Count errors by type\nfields @timestamp, @message\n| filter @message like /ERROR/\n| parse @message \"ERROR:  *\" as error_msg\n| stats count(*) as error_count by error_msg\n| sort error_count desc\n| limit 20\n\n-- Find connection storms (many connections in short window)\nfields @timestamp, @message\n| filter @message like /connection received/\n| stats count(*) as conn_count by bin(1m)\n| sort @timestamp desc\n\n-- Find lock timeout errors\nfields @timestamp, @message\n| filter @message like /lock timeout/ or @message like /deadlock detected/\n| sort @timestamp desc\n| limit 50",
+          action: "# Enable slow query logging on RDS/Aurora via Parameter Group:\n# log_min_duration_statement = 1000   -- Log queries over 1 second (ms)\n# log_connections = 1                  -- Log new connections\n# log_disconnections = 1               -- Log disconnections\n# log_lock_waits = 1                   -- Log lock waits\n# log_temp_files = 0                   -- Log all temp file creation\n# log_autovacuum_min_duration = 0      -- Log all autovacuum runs\n\n# AWS CLI: query logs via Logs Insights\naws logs start-query \\\n  --log-group-name /aws/rds/cluster/my-cluster/postgresql \\\n  --start-time $(date -d '1 hour ago' +%s) \\\n  --end-time $(date +%s) \\\n  --query-string 'fields @timestamp, @message | filter @message like /duration:/ | sort @timestamp desc | limit 50'\n\n# Get query results\naws logs get-query-results --query-id <query-id>\n\n# Download full log file\naws rds download-db-log-file-portion \\\n  --db-instance-identifier my-db \\\n  --log-file-name error/postgresql.log.2024-01-01.00 \\\n  --output text > pg.log",
+          warning: "⚠️ Enabling verbose logging (log_connections, log_disconnections) on high-traffic instances generates large log volumes and increases storage costs. Start with log_min_duration_statement and add others as needed.",
           guidance: [
-            "💡 Understanding Locks:",
-            "PostgreSQL uses MVCC for most reads (no locks needed)",
-            "Locks occur during writes, DDL operations, and explicit LOCK commands",
-            "blocked_locks.granted = false means query is waiting for a lock",
-            "Long-running transactions hold locks longer",
+            "💡 RDS/Aurora Log Setup:",
+            "Logs are in CloudWatch under /aws/rds/instance/<id>/postgresql or /aws/rds/cluster/<id>/postgresql",
+            "Set log_min_duration_statement in the DB Parameter Group (not postgresql.conf)",
+            "Parameter Group changes require reboot only for static parameters; most log params are dynamic",
+            "Aurora Serverless v2 logs behave the same as provisioned Aurora PostgreSQL",
             "",
-            "💡 Lock Modes (least to most restrictive):",
-            "ACCESS SHARE: SELECT (doesn't conflict with most operations)",
-            "ROW SHARE: SELECT FOR UPDATE",
-            "ROW EXCLUSIVE: INSERT, UPDATE, DELETE",
-            "SHARE UPDATE EXCLUSIVE: VACUUM, CREATE INDEX CONCURRENTLY",
-            "SHARE: CREATE INDEX (locks out writes)",
-            "EXCLUSIVE: Refresh materialized views",
-            "ACCESS EXCLUSIVE: DDL operations (ALTER, DROP, TRUNCATE, VACUUM FULL)",
+            "💡 Key Parameters to Enable:",
+            "log_min_duration_statement = 1000: Captures queries taking >1s (tune down to 500 or 250 for more detail)",
+            "log_lock_waits = on: Essential for diagnosing lock contention",
+            "log_temp_files = 0: Logs any temp file creation (indicates work_mem pressure)",
+            "log_autovacuum_min_duration = 0: Logs all autovacuum activity",
+            "log_connections / log_disconnections: Useful for connection leak debugging (noisy on busy DBs)",
             "",
-            "💡 Common Blocking Scenarios:",
-            "Long UPDATE/DELETE blocking other writes to same rows",
-            "ALTER TABLE blocking all access to table",
-            "CREATE INDEX (without CONCURRENTLY) blocking writes",
-            "VACUUM FULL blocking all access",
-            "Explicit LOCK TABLE commands",
+            "💡 CloudWatch Logs Insights Tips:",
+            "Use bin(5m) or bin(1m) to aggregate by time window",
+            "parse extracts fields from unstructured log lines",
+            "Queries are limited to the selected time range - start narrow, expand if needed",
+            "Save frequent queries as CloudWatch dashboards for ongoing monitoring",
             "",
-            "💡 Reducing Lock Contention:",
-            "Keep transactions short and fast",
-            "Use CREATE INDEX CONCURRENTLY for index creation",
-            "Avoid LOCK TABLE unless absolutely necessary",
-            "Use smaller batches for large UPDATE/DELETE operations",
-            "Consider partitioning to reduce lock scope",
-            "Run DDL during maintenance windows",
+            "💡 Aurora-Specific:",
+            "Performance Insights (if enabled) is often faster than log queries for per-query stats",
+            "Aurora has enhanced monitoring metrics at 1-second granularity",
+            "Use RDS Proxy logs to correlate application connections with DB activity",
             "",
-            "💡 Wait Events:",
-            "Lock wait events indicate lock contention",
-            "LWLock = lightweight lock (internal PostgreSQL structures)",
-            "Common: BufferPin, LockManager, WALWrite",
-            "Monitor wait_event_type and wait_event columns",
-            "",
-            "📊 Monitor: pg_locks, pg_stat_activity (wait_event columns)"
+            "📊 Also check: RDS Performance Insights, Enhanced Monitoring, CloudWatch metrics (DatabaseConnections, FreeableMemory, ReadIOPS, WriteIOPS)"
           ],
           checks: [
-            { label: "Queries blocked > 30 seconds?", key: "longBlocking", advice: "Find blocking query in pg_stat_activity. Optimize or kill blocking session: SELECT pg_terminate_backend(blocking_pid). Add indexes to speed up blocking query. Shorten transaction durations." },
-            { label: "ACCESS EXCLUSIVE locks on busy tables?", key: "exclusiveLocks", advice: "ACCESS EXCLUSIVE locks block all access. Use CREATE INDEX CONCURRENTLY instead of CREATE INDEX. Schedule DDL (ALTER TABLE, VACUUM FULL) during maintenance windows. Avoid LOCK TABLE commands on production tables." },
-            { label: "Many lock waits in pg_stat_activity?", key: "lockWaits", advice: "Check wait_event and wait_event_type columns. Common: Lock (row locks), Extend (table extension). Add indexes to reduce scan times. Keep transactions short. Use lock_timeout to prevent indefinite waits: SET lock_timeout = '5s'." },
-            { label: "DDL operations during peak hours?", key: "peakDDL", advice: "Schedule DDL operations (ALTER TABLE, DROP, etc.) during maintenance windows. Use CONCURRENTLY option when available (CREATE INDEX CONCURRENTLY). Test DDL duration in non-prod first to estimate impact." },
-            { label: "No lock_timeout configured?", key: "noLockTimeout", advice: "Set lock_timeout to prevent queries from waiting indefinitely: ALTER SYSTEM SET lock_timeout = '30s'. Or per-session: SET lock_timeout = '10s'. This prevents pile-ups when locks are held too long." }
+            { label: "log_min_duration_statement not set?", key: "noSlowQueryLog", advice: "Set log_min_duration_statement = 1000 in your RDS/Aurora Parameter Group to capture queries over 1 second. Apply the parameter group to your instance and reboot if required (check 'apply type' in Parameter Group)." },
+            { label: "No CloudWatch log group for PostgreSQL?", key: "noLogGroup", advice: "Enable log exports in RDS console: Modify instance → Log exports → check 'PostgreSQL log'. Or via CLI: aws rds modify-db-instance --db-instance-identifier mydb --cloudwatch-logs-export-configuration EnableLogTypes=postgresql." },
+            { label: "High frequency of ERROR messages?", key: "frequentErrors", advice: "Use the error count Logs Insights query to group errors by type. Common Aurora errors: SSL connection issues, max_connections exceeded, out of shared memory. Address the most frequent error type first." },
+            { label: "Queries over 5 seconds appearing frequently?", key: "verySlowQueries", advice: "Export the slow query log and analyze with pgBadger (next step). Check if queries correlate with high CPU/IO in CloudWatch metrics. Run EXPLAIN ANALYZE on the worst offenders." },
+            { label: "Log storage costs too high?", key: "highLogCosts", advice: "Set a CloudWatch log retention policy: aws logs put-retention-policy --log-group-name /aws/rds/... --retention-in-days 7. Raise log_min_duration_statement to reduce volume (e.g., 5000ms). Disable log_connections if enabled." }
+          ]
+        },
+        {
+          title: "Analyze Logs with pgBadger",
+          description: "Generate query performance reports from PostgreSQL logs",
+          action: "# Install pgBadger\nbrew install pgbadger          # macOS\napt-get install pgbadger       # Ubuntu/Debian\nyum install pgbadger           # RHEL/CentOS\n\n# Download log from RDS/Aurora\naws rds download-db-log-file-portion \\\n  --db-instance-identifier my-db-instance \\\n  --log-file-name error/postgresql.log.2024-01-01.00 \\\n  --output text > postgresql.log\n\n# For Aurora clusters, download from the writer instance\naws rds download-db-log-file-portion \\\n  --db-instance-identifier my-aurora-instance-1 \\\n  --log-file-name error/postgresql.log.2024-01-01.00 \\\n  --output text > postgresql.log\n\n# Generate HTML report (single file)\npgbadger postgresql.log -o report.html\n\n# Generate report with prefix for RDS format\npgbadger postgresql.log \\\n  --prefix '%t:%r:%u@%d:[%p]:' \\\n  -o report.html\n\n# Process multiple log files\npgbadger /path/to/logs/postgresql.log.* -o report.html\n\n# Incremental processing (for large log volumes)\npgbadger postgresql.log \\\n  --outfile report.html \\\n  --last-parsed .pgbadger_last_state\n\n# JSON output for scripting\npgbadger postgresql.log -o report.json --format json\n\n# Open report\nopen report.html   # macOS",
+          guidance: [
+            "💡 What pgBadger Reveals:",
+            "Top slowest queries ranked by total time, average time, and call count",
+            "Queries with most I/O (reads/writes)",
+            "Connections and disconnections over time",
+            "Lock waits and deadlocks",
+            "Temporary file usage (work_mem pressure)",
+            "Autovacuum and autoanalyze activity",
+            "Error and warning frequency",
+            "",
+            "💡 Required Log Settings for Full Report:",
+            "log_min_duration_statement = 0-1000 (lower = more data, larger logs)",
+            "log_line_prefix must include %t (timestamp) and %p (PID) at minimum",
+            "For RDS/Aurora, the default log_line_prefix is usually compatible",
+            "log_lock_waits = on for lock contention analysis",
+            "log_temp_files = 0 for temp file tracking",
+            "",
+            "💡 RDS/Aurora Log Download Tips:",
+            "Logs rotate hourly on RDS; download each hour's file separately",
+            "Use --starting-token for large files that exceed single API response",
+            "Script multi-file downloads: for h in 00 01 02 ... 23; do aws rds download-db-log-file-portion ... --log-file-name error/postgresql.log.YYYY-MM-DD.$h; done",
+            "Aurora: each instance in the cluster has its own log — download from the writer for most query activity",
+            "",
+            "💡 Interpreting the Report:",
+            "Focus on 'Slowest queries' by total time — these have the most optimization leverage",
+            "High call count + moderate duration = high-frequency query worth indexing",
+            "High average duration + low call count = complex query to rewrite",
+            "Temp file section: any entries indicate work_mem is too low for those queries",
+            "Lock section: frequent locks point to transaction design or missing indexes",
+            "",
+            "💡 Automating for RDS/Aurora:",
+            "Schedule daily log download + pgBadger run via cron or Lambda",
+            "Push HTML report to S3 for team access",
+            "Use pgBadger --incremental for continuous monitoring without reprocessing old logs",
+            "",
+            "📊 Combine with: CloudWatch Logs Insights (real-time), Performance Insights (per-query stats), EXPLAIN ANALYZE (individual query deep-dive)"
+          ],
+          checks: [
+            { label: "Report shows queries with high total time?", key: "highTotalTime", advice: "These are your highest-priority optimization targets. Total time = avg_duration × call_count. Run EXPLAIN ANALYZE on the top 3-5 queries. Add indexes, rewrite patterns, or tune work_mem based on findings." },
+            { label: "Many temp file entries in report?", key: "tempFiles", advice: "Temp files mean work_mem is too small for those operations. Increase work_mem: SET work_mem = '256MB' (or permanently in Parameter Group). Check which queries generate temp files and add indexes to eliminate sorts/hashes." },
+            { label: "High lock wait counts?", key: "lockWaitReport", advice: "Review the lock section for which tables/queries are involved. Add indexes to speed up locking queries. Shorten transactions. Consider READ_COMMITTED_SNAPSHOT or row-level locking strategies." },
+            { label: "Autovacuum running very frequently?", key: "frequentVacuum", advice: "Frequent autovacuum on specific tables means high churn. Tune per-table: ALTER TABLE t SET (autovacuum_vacuum_scale_factor = 0.05). Check for long transactions blocking cleanup." },
+            { label: "Report is mostly empty / missing queries?", key: "emptyReport", advice: "Check log_min_duration_statement setting — if too high, few queries are logged. Verify log format compatibility: pgBadger needs timestamps in the log prefix. Try pgbadger --debug to see parsing errors." }
           ]
         }
       ],
