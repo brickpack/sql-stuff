@@ -1815,6 +1815,11 @@ def run_query(conn, db_type, sql_text):
                 results.append({"__info__": f"{prefix}Statement executed (no result set)."})
         except Exception as exc:
             results.append({"error": f"{prefix}{exc}"})
+            # Reset aborted transaction so subsequent queries can run
+            try:
+                conn.rollback()
+            except Exception:
+                pass
 
     return results if results else [{"__info__": "No results returned."}]
 
@@ -1937,19 +1942,40 @@ def run_session(db_type, conn, conn_params):
 
         # SQL — show and optionally run
         if step.get("sql"):
-            print("\n  Diagnostic SQL:")
-            for line in step["sql"].split("\n"):
-                print(f"    {line}")
-            print()
+            sql_to_run = step["sql"]
 
-            run_it = prompt_yn("  Run this diagnostic query?", default_yes=True)
-            if run_it:
+            # If the SQL contains a placeholder, prompt the user to supply their query
+            if "your_query_here" in sql_to_run:
+                print("\n  Diagnostic SQL (template — requires your query):")
+                for line in sql_to_run.split("\n"):
+                    print(f"    {line}")
                 print()
-                results = run_query(conn, db_type, step["sql"])
-                step_record["sql_results"] = results
-                print_table(results)
+                print("  This step requires you to provide a query to analyze.")
+                user_query = input("  Enter your query (or leave blank to skip): ").strip()
+                if not user_query:
+                    print("  Skipping — no query provided.")
+                    step_record["sql_results"] = None
+                    # Still show checks/guidance below
+                else:
+                    sql_to_run = sql_to_run.replace("your_query_here", user_query)
+                    print("\n  Running with your query...")
+                    results = run_query(conn, db_type, sql_to_run)
+                    step_record["sql_results"] = results
+                    print_table(results)
             else:
-                step_record["sql_results"] = None
+                print("\n  Diagnostic SQL:")
+                for line in sql_to_run.split("\n"):
+                    print(f"    {line}")
+                print()
+
+                run_it = prompt_yn("  Run this diagnostic query?", default_yes=True)
+                if run_it:
+                    print()
+                    results = run_query(conn, db_type, sql_to_run)
+                    step_record["sql_results"] = results
+                    print_table(results)
+                else:
+                    step_record["sql_results"] = None
 
         # Checks (yes/no questions)
         if step.get("checks"):
