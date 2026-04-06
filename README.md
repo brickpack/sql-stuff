@@ -46,9 +46,60 @@ npm run preview
 npm run deploy
 ```
 
+## CLI Troubleshooter (Python)
+
+In addition to the web app, two Python scripts let you run the same troubleshooting steps directly against a live database from the command line.
+
+### Prerequisites
+
+Install the driver for your database:
+
+| Database   | Package                                      |
+|------------|----------------------------------------------|
+| PostgreSQL | `pip install psycopg2`                       |
+| SQL Server | `pip install pyodbc`                         |
+| MySQL      | `pip install mysql-connector-python`         |
+| Oracle     | `pip install cx_Oracle`                      |
+| Snowflake  | `pip install snowflake-connector-python`     |
+
+### Step 1 — Run the interactive troubleshooter
+
+```bash
+python db_troubleshooter.py
+```
+
+The script will prompt you to:
+
+1. Select a database type
+2. Enter connection details (host, port, database name, username, password)
+3. Step through each diagnostic check — for each step you can:
+   - Run the diagnostic SQL against your live database
+   - Answer yes/no checks (flagged issues display actionable advice)
+   - Optionally apply fix SQL (default is **No** — destructive actions are never applied automatically)
+   - Press `s` to skip a step or `q` to quit early
+
+Results are saved to `troubleshoot_results.json` in the current directory.
+
+### Step 2 — Generate the HTML report
+
+```bash
+python results_viewer.py
+```
+
+Reads `troubleshoot_results.json` and writes `troubleshoot_report.html`, then opens it in your default browser. To read a different results file:
+
+```bash
+python results_viewer.py /path/to/troubleshoot_results.json
+```
+
+The report includes:
+
+- **Action Items** — a consolidated list of all flagged checks with advice, grouped by step
+- **Step-by-step results** — collapsible cards with query output tables, check answers, and applied actions
+
 ## Project Structure
 
-```
+```text
 ├── src/
 │   ├── main.tsx              # React app entry point
 │   └── DBTroubleshooter.tsx # Main component
