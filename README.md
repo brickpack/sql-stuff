@@ -97,12 +97,21 @@ The report includes:
 - **Action Items** — a consolidated list of all flagged checks with advice, grouped by step
 - **Step-by-step results** — collapsible cards with query output tables, check answers, and applied actions
 
+## PostgreSQL DBA Scripts
+
+[`scripts/postgres/`](scripts/postgres/) contains read-only inventory and troubleshooting SQL for PostgreSQL 16+ (sessions, locks, slow queries, vacuum/wraparound, indexes, I/O, replication, and a one-shot health snapshot). See its [README](scripts/postgres/README.md) for details.
+
+```bash
+psql -X -d mydb -f scripts/postgres/troubleshooting/08_health_snapshot.sql
+```
+
 ## Project Structure
 
 ```text
 ├── src/
 │   ├── main.tsx              # React app entry point
 │   └── DBTroubleshooter.tsx # Main component
+├── scripts/postgres/         # DBA inventory & troubleshooting SQL
 ├── .github/workflows/
 │   └── deploy.yml            # GitHub Actions deployment
 ├── dist/                     # Production build output
