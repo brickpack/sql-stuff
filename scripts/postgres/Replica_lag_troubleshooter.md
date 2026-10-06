@@ -21,7 +21,7 @@ Aurora readers apply the writer's redo to pages already in their buffer cache. L
 | 1 | **Download log files now** if logs aren't exported to CloudWatch (§1) | 10 min | They rotate after 3 days by default |
 | 2 | **Review Performance Insights for the incident window** (§1) | 15 min | Only 7 days of retention on the default tier |
 | 3 | **Ask whether "lag" is the metric or stale data** (§2) | 1 question | Separates a database problem from a Rails read-routing problem |
-| 4 | **Overlay writer `TransactionLogsGeneration` on reader `AuroraReplicaLag`** (§3) | 10 min | The strongest single correlator: tells you whether it's a write burst or a reader-side cause |
+| 4 | **Overlay writer `WriteIOPS` on reader `AuroraReplicaLag`, and check RDS Proxy `DatabaseConnectionsCurrentlyInTransaction`** (§3) | 10 min | Tells you whether the cause is a write burst or long reader transactions |
 | 5 | **Run the incident-timeline Logs Insights query** (§4) | 10 min | Shows DDL, vacuum, conflicts and slow SQL in time order |
 | 6 | **Enable Rails query log tags** (§7) | 1 config change + deploy | Ties every query to a controller or job |
 | 7 | **Turn on the key logging parameters and log export** (§7) | 15 min, no reboot | So the next incident is fully captured |
@@ -84,16 +84,88 @@ aws cloudwatch get-metric-statistics --namespace AWS/RDS \
 
 Use the **onset** of the spike, not its peak, and set a window of roughly 15 minutes before to 10 minutes after.
 
-Graph these together at 1-minute Maximum:
+### CloudWatch metrics (`AWS/RDS`)
 
-- **Writer:** `TransactionLogsGeneration`, `WriteIOPS`, `DBLoad`, `MaximumUsedTransactionIDs`
-- **Reader:** `AuroraReplicaLag`, `CPUUtilization`, `FreeableMemory`, `BufferCacheHitRatio`
-- **RDS Proxy:** `DatabaseConnectionsCurrentlySessionPinned`, `QueryDatabaseResponseLatency`
+Graph these together at **1-minute Maximum** unless noted. Metrics marked ★ are the ones to start with.
 
-How to read the graph:
+**Writer: is it producing a burst of redo?**
 
-- **Writer redo jumps first and lag follows:** a write burst. Find the job, migration or statement.
-- **Redo is flat but lag climbs:** reader-side contention. Look for long reader transactions or resource starvation.
+| Metric | What it tells you |
+|---|---|
+| ★ `WriteIOPS` | Aurora storage write records per second, roughly the number of redo log records generated. **This is your redo-rate metric on Aurora.** |
+| ★ `WriteThroughput` | Bytes per second written to storage. Big rows and TOAST show up here more than in `WriteIOPS`. |
+| `StorageNetworkTransmitThroughput` | Bytes per second sent to the storage layer. Another view of the same burst. |
+| `CommitThroughput`, `CommitLatency` | Commit rate and commit time. Many small commits versus a few huge ones. |
+| ★ `DBLoad`, `DBLoadCPU`, `DBLoadNonCPU` | Active sessions. Published by Performance Insights. |
+| `MaximumUsedTransactionIDs` | Rising transaction ID age means anti-wraparound vacuums are coming, which are heavy redo producers. |
+| `VolumeWriteIOPs` (cluster level) | 5-minute granularity only. Useful as a coarse confirmation over longer ranges. |
+
+**Reader: was replay blocked, or was the instance starved?**
+
+| Metric | What it tells you |
+|---|---|
+| ★ `AuroraReplicaLag` | Use the reader's instance dimension. `AuroraReplicaLagMaximum` and `AuroraReplicaLagMinimum` are reported on the writer. |
+| ★ `EngineUptime` | Drops to near zero when the instance restarts. A reset at the spike means Aurora restarted the lagging reader. |
+| ★ `CPUUtilization`, `DBLoad`, `DBLoadCPU`, `DBLoadNonCPU` | Reader CPU saturation and active sessions. |
+| `FreeableMemory`, `SwapUsage`, `AuroraEstimatedSharedMemoryBytes` | Memory pressure. `SwapUsage` isn't published for db.r7g classes. |
+| `BufferCacheHitRatio`, `ReadIOPS`, `ReadLatency`, `DiskQueueDepth` | Cache misses forcing storage reads. |
+| `StorageNetworkReceiveThroughput` | Bytes per second pulled from storage; rises with cache misses. |
+| `FreeLocalStorage` | Local temp-file space. A sharp drop means big sorts or hashes spilling to disk on the reader. |
+| `DatabaseConnections`, `Deadlocks` | Connection surges and deadlocks. |
+
+**RDS Proxy (reader side).** Use the `ProxyName`, `TargetGroup`, `TargetRole` dimensions with `TargetRole = READ_ONLY`.
+
+| Metric | Statistic | What it tells you |
+|---|---|---|
+| ★ `DatabaseConnectionsCurrentlyInTransaction` | Sum | Connections with an open transaction. A climb before the lag spike points to long reader transactions blocking replay. |
+| `DatabaseConnectionsCurrentlySessionPinned` | Sum | Pinned sessions. Expect this to be high with Rails, which issues `SET` commands on connect. |
+| `DatabaseConnectionsBorrowLatency` | Average | Time to get a database connection from the pool. Rises when the pool is exhausted. |
+| `ClientConnections`, `DatabaseConnections` | Sum | Connection surges, for example after a deploy. |
+
+> **Caution:** `QueryDatabaseResponseLatency`, `QueryResponseLatency` and `QueryRequests` don't include PostgreSQL traffic that uses the extended query protocol. Rails' `pg` adapter uses it for prepared statements and parameterized queries, so these metrics may undercount or show nothing for your app. Don't read a flat line there as "the database was fine."
+
+### Performance Insights counters (1-minute, 7-day retention)
+
+These aren't in CloudWatch, but you can add them to the Performance Insights or Database Insights dashboard for each instance, or pull them with the CLI. Several map directly onto the causes of lag.
+
+| Counter | Instance | What it tells you |
+|---|---|---|
+| ★ `db.Transactions.oldest_reader_feedback_xid_age` | Writer (check both) | Age of the oldest long-running transaction on an Aurora reader. The most direct signal for "a reader transaction is blocking things." |
+| ★ `db.SQL.tup_updated`, `db.SQL.tup_inserted`, `db.SQL.tup_deleted` | Writer | Rows changed per second. Pins down a write burst and whether it was updates, inserts or deletes. |
+| `db.Checkpoint.checkpoints_req` | Writer | Forced checkpoints, which lead to bursts of full-page writes. |
+| ★ `db.state.idle_in_transaction_count`, `db.state.idle_in_transaction_max_time` | Reader | Sessions holding a transaction open while doing nothing, and the longest such session in seconds. |
+| `db.Transactions.active_transactions`, `db.Transactions.blocked_transactions`, `db.Locks.num_blocked_sessions` | Reader | Transaction pile-ups and blocking. |
+| `db.Temp.temp_bytes` | Reader | Temp-file spills from big sorts or hashes. |
+| `db.IO.storage_blks_read` | Reader | Blocks read from Aurora storage, meaning cache misses. |
+| `os.cpuUtilization.steal`, `os.loadAverageMinute.one`, `os.swap.in`, `os.memory.outOfMemoryKillCount` | Reader | OS-level starvation. |
+
+```bash
+aws pi get-resource-metrics --service-type RDS \
+  --identifier <writer-DbiResourceId> \
+  --start-time 2026-09-30T14:00:00Z --end-time 2026-09-30T15:00:00Z \
+  --period-in-seconds 60 \
+  --metric-queries '[{"Metric":"db.SQL.tup_updated.avg"},
+                     {"Metric":"db.SQL.tup_deleted.avg"},
+                     {"Metric":"db.Transactions.oldest_reader_feedback_xid_age.max"}]'
+```
+
+The identifier is the instance's `DbiResourceId` (it starts with `db-`), not its name. Run `aws rds describe-db-instances --query 'DBInstances[].[DBInstanceIdentifier,DbiResourceId]'` to find it.
+
+### Metrics to skip
+
+| Metric | Why |
+|---|---|
+| `TransactionLogsGeneration` | RDS for PostgreSQL only. Aurora doesn't publish it. Use `WriteIOPS` and `WriteThroughput` instead. |
+| `TransactionLogsDiskUsage` | On Aurora PostgreSQL it's only populated when logical replication or DMS is in use; otherwise it reports `-1`. If it shows real values, that tells you logical replication is active, which is worth asking about, but it doesn't measure redo for the reader. |
+| `OldestReplicationSlotLag`, `ReplicationSlotDiskUsage` | Logical replication slots only. Not related to Aurora reader lag. |
+| `DMLThroughput`, `DDLThroughput`, `ActiveTransactions`, `BlockedTransactions` | Aurora MySQL only. Use the Performance Insights counters above instead. |
+
+### How to read the graph
+
+- **Writer `WriteIOPS` and `db.SQL.tup_*` jump first, then lag follows:** a write burst. Find the job, migration or statement with Performance Insights Top SQL on the writer and the §4 log queries.
+- **Writer is flat, but `oldest_reader_feedback_xid_age`, `idle_in_transaction_max_time` or proxy `DatabaseConnectionsCurrentlyInTransaction` climbs before the lag:** long reader transactions are blocking replay.
+- **Writer is flat, and reader CPU, memory, `ReadIOPS` or `FreeLocalStorage` spikes:** the reader is starved. Check the instance class and the reader's top SQL.
+- **Reader `EngineUptime` resets at the spike:** Aurora restarted the reader for falling too far behind. Confirm in RDS events below.
 - **Lag stays low but users see stale data:** read routing, covered in §6.
 
 Also check RDS events for reader restarts. Aurora restarts a reader that falls too far behind:
