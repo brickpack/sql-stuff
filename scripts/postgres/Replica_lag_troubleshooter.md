@@ -1,34 +1,35 @@
-# Aurora PostgreSQL 16.13 – Reader Replica Lag Runbook (Rails)
+# Aurora PostgreSQL 16.13 – Replica Lag and CDC Runbook (Rails)
 
-**Topology:** Ruby on Rails app → PgBouncer → writer; Rails app → RDS Proxy → reader.
-**Symptom:** intermittent replica lag or stale reads on the reader.
+**Topology:** Rails app → PgBouncer → writer; Rails app → RDS Proxy → reader. A logical replication (CDC) consumer reads from the writer.
+**Symptom:** intermittent problems reported by the app team, believed to be replica lag on the reader.
+**Current lead:** writer `TransactionLogsDiskUsage` spikes at exactly the times the app team reports problems.
 
-## How Aurora lag happens
+## Background in two minutes
 
-Aurora readers apply the writer's redo to pages already in their buffer cache. Lag comes from one of four things:
+**Aurora reader lag.** Aurora readers apply the writer's redo to pages already in their buffer cache. Lag has four usual causes:
 
-1. **Write burst**: the writer produced redo faster than the reader could apply it (bulk DML, data migrations, vacuum, job-queue churn).
-2. **Replay blocked**: reader queries conflict with redo (DDL locks, buffer pins, long snapshots).
-3. **Reader starved**: CPU, memory or cache pressure, often from an undersized reader.
-4. **Not lag at all**: the app reads the replica right after writing. The metric looks fine, but the data is stale.
+1. **Write burst:** the writer produces redo faster than the reader can apply it (bulk DML, data migrations, vacuum, job-queue churn).
+2. **Replay blocked:** reader queries conflict with redo (DDL locks, buffer pins, long snapshots).
+3. **Reader starved:** CPU, memory or cache pressure, often from an undersized reader.
+4. **Not lag at all:** the app reads the replica right after writing. The metric looks fine, but the data is stale.
 
-> **Current lead:** writer `TransactionLogsDiskUsage` spikes at exactly the times the app team reports problems. That metric only has real values when logical replication or DMS is in use, so a logical replication (CDC) consumer is involved. See §8.
+**Why `TransactionLogsDiskUsage` matters.** On Aurora PostgreSQL this metric only has real values when logical replication or DMS is in use; otherwise it reports `-1`. It rises when a replication slot holds WAL that its consumer hasn't confirmed. So whatever happens at the spike times involves the CDC consumer, a big transaction it's decoding, or both.
 
 ---
 
-## The short list (best bang for the buck)
+## The short list
 
-| # | Action | Effort | Why |
+| # | Action | Section | Effort |
 |---|---|---|---|
-| 1 | **Download log files now** if logs aren't exported to CloudWatch (§1) | 10 min | They rotate after 3 days by default |
-| 2 | **Review Performance Insights for the incident window** (§1) | 15 min | Only 7 days of retention on the default tier |
-| 3 | **Identify the logical replication consumer and run the slot queries** (§8) | 20 min | `TransactionLogsDiskUsage` lines up with the app's problems; find out who owns the slot and why WAL piles up |
-| 4 | **Ask whether "lag" is the metric or stale data** (§2) | 1 question | Separates a database problem from a Rails read-routing problem |
-| 5 | **Overlay writer `WriteIOPS` and `TransactionLogsDiskUsage` on reader `AuroraReplicaLag`, and check RDS Proxy `DatabaseConnectionsCurrentlyInTransaction`** (§3) | 10 min | Tells you whether the cause is a write burst, the CDC consumer or long reader transactions |
-| 6 | **Run the incident-timeline and replication Logs Insights queries** (§4) | 10 min | Shows DDL, vacuum, conflicts, slow SQL and consumer disconnects in time order |
-| 7 | **Enable Rails query log tags** (§7) | 1 config change + deploy | Ties every query to a controller or job |
-| 8 | **Turn on the key logging parameters and log export** (§7) | 15 min, no reboot | So the next incident is fully captured |
-| 9 | **Set alarms on `AuroraReplicaLag` and `TransactionLogsDiskUsage`** (§7) | 10 min | Catches the next spike live, so you can run the SQL in §5 and §8 |
+| 1 | **Download log files** if logs aren't exported to CloudWatch. They rotate after 3 days. | §1 | 10 min |
+| 2 | **Review Performance Insights for the spike windows.** Data is kept for 7 days. | §1 | 15 min |
+| 3 | **Decide what the app team is actually seeing:** reader lag, stale data, or writer slowness. | §2 | 15 min |
+| 4 | **Identify the CDC consumer and check the slots.** | §3 | 20 min |
+| 5 | **Find the transaction or job that was running at the spike.** | §3, §5 | 20 min |
+| 6 | **Run the timeline and replication Logs Insights queries.** | §5 | 10 min |
+| 7 | **Enable Rails query log tags, logging parameters and alarms**, so the next spike is fully captured. | §8 | 30 min + deploy |
+
+Record what you find in the findings log at the end as you go.
 
 ---
 
@@ -42,230 +43,117 @@ Aurora readers apply the writer's redo to pages already in their buffer cache. L
 | Enhanced Monitoring (`RDSOSMetrics`) | 30 days |
 | RDS events | 14 days |
 
-If logs aren't exported to CloudWatch, pull them from **both** instances:
+If logs aren't exported to CloudWatch, pull them from **both** instances. The writer matters most for the current lead.
 
 ```bash
-aws rds describe-db-log-files --db-instance-identifier <reader-id> \
+aws rds describe-db-log-files --db-instance-identifier <writer-id> \
   --query 'DescribeDBLogFiles[].[LogFileName,LastWritten,Size]' --output table
 
-aws rds download-db-log-file-portion --db-instance-identifier <reader-id> \
-  --log-file-name error/postgresql.log.2026-09-30-14 \
-  --starting-token 0 --output text > reader_2026-09-30-14.log
+aws rds download-db-log-file-portion --db-instance-identifier <writer-id> \
+  --log-file-name error/postgresql.log.<YYYY-MM-DD-HH> \
+  --starting-token 0 --output text > writer_<YYYY-MM-DD-HH>.log
 ```
 
-In **Performance Insights**, zoom to the incident window on both instances and screenshot what you find:
+In **Performance Insights**, zoom to each spike on both instances and screenshot what you find:
 
-- **Writer:** Top SQL during the spike, which usually identifies the culprit.
+- **Writer:** Top SQL and top waits. Look for a large write statement, and for walsender (logical decoding) processes among the waits.
 - **Reader:** top waits. Lock or `BufferPin` waits mean replay was blocked; CPU or IO waits mean the reader was starved.
 
 ---
 
-## 2. Ask the team
+## 2. Decide what the problem actually is
 
-1. **Is "lag" the `AuroraReplicaLag` metric, or the app seeing stale or missing data?** Stale data with a normal metric is a read-routing problem, covered in §6.
-2. **What deployed or ran on a schedule around the incident?** Ask about migrations, Rake tasks, and cron jobs (sidekiq-cron, whenever, GoodJob cron).
-3. **Which job system do you use**: Sidekiq, GoodJob, Solid Queue? Do any jobs read from the replica?
-4. **Are jobs enqueued in `after_commit`**, or in `after_save` and `after_create`?
-5. **Is Rails multi-database role switching used** (`connects_to`, `connected_to(role: :reading)`)? What's the `DatabaseSelector` `delay`?
-6. **Is the reader the same instance class as the writer?**
-7. **Do you use `strong_migrations`,** and do migrations use `algorithm: :concurrently` for indexes?
-8. **Is `prepared_statements: false` set** for the PgBouncer connection?
-9. **What consumes logical replication from this cluster?** DMS, Debezium/Kafka, a zero-ETL integration, a logical subscriber, an analytics pipeline?
-10. **Did that consumer restart, error or fall behind at the spike times?** Check DMS task logs, Kafka Connect logs or the integration's status page.
-11. **Could any replication slot be abandoned**, for example left over from an old migration?
+`TransactionLogsDiskUsage` is a writer metric, so don't assume the problem is reader lag. Graph these together at **1-minute Maximum** across several spike times:
 
----
+- writer `TransactionLogsDiskUsage`
+- reader `AuroraReplicaLag`
+- writer `CPUUtilization` and `DBLoad`
 
-## 3. Find the window and correlate the metrics
+Then ask the app team exactly what they see (slow responses, timeouts, stale or missing data) and on which code paths.
 
-Find the real spike using **Maximum** at a **1-minute** period. Averages hide short spikes.
+| What you see | What it means | Go to |
+|---|---|---|
+| Reader lag spikes **with** `TransactionLogsDiskUsage` | One event, usually a big write, causes both | §3, then §4 |
+| `TransactionLogsDiskUsage` spikes, reader lag **stays low**, writer CPU or load rises | Writer-side problem: decoding or catch-up load on the writer | §3 |
+| Reader lag spikes **without** `TransactionLogsDiskUsage` | A separate reader-side problem | §4 |
+| Both metrics normal, but users see stale data | Rails read routing, not the database | §7 |
+
+To find exact spike times, sort the metric by its Maximum:
 
 ```bash
 aws cloudwatch get-metric-statistics --namespace AWS/RDS \
-  --metric-name AuroraReplicaLag \
-  --dimensions Name=DBInstanceIdentifier,Value=<reader-id> \
-  --start-time 2026-09-29T00:00:00Z --end-time 2026-10-01T00:00:00Z \
+  --metric-name TransactionLogsDiskUsage \
+  --dimensions Name=DBInstanceIdentifier,Value=<writer-id> \
+  --start-time <start> --end-time <end> \
   --period 60 --statistics Maximum --output text | sort -k2 -n | tail -20
 ```
 
-Use the **onset** of the spike, not its peak, and set a window of roughly 15 minutes before to 10 minutes after.
-
-### CloudWatch metrics (`AWS/RDS`)
-
-Graph these together at **1-minute Maximum** unless noted. Metrics marked ★ are the ones to start with.
-
-**Writer: is it producing a burst of redo?**
-
-| Metric | What it tells you |
-|---|---|
-| ★ `WriteIOPS` | Aurora storage write records per second, roughly the number of redo log records generated. **This is your redo-rate metric on Aurora.** |
-| ★ `WriteThroughput` | Bytes per second written to storage. Big rows and TOAST show up here more than in `WriteIOPS`. |
-| `StorageNetworkTransmitThroughput` | Bytes per second sent to the storage layer. Another view of the same burst. |
-| `CommitThroughput`, `CommitLatency` | Commit rate and commit time. Many small commits versus a few huge ones. |
-| ★ `DBLoad`, `DBLoadCPU`, `DBLoadNonCPU` | Active sessions. Published by Performance Insights. |
-| `MaximumUsedTransactionIDs` | Rising transaction ID age means anti-wraparound vacuums are coming, which are heavy redo producers. |
-| `VolumeWriteIOPs` (cluster level) | 5-minute granularity only. Useful as a coarse confirmation over longer ranges. |
-| ★ `TransactionLogsDiskUsage` | Disk space used by transaction logs. Only populated when logical replication or DMS is in use (otherwise `-1`). Rises when a replication slot holds WAL its consumer hasn't confirmed. **Current lead; see §8.** |
-| `ReplicationSlotDiskUsage` | Disk space used by replication slot files. |
-| `OldestReplicationSlotLag` | How far, in bytes of WAL, the most-lagging slot consumer is behind. |
-| `FreeLocalStorage` (writer) | Local storage available on the writer. Drops if retained WAL or decoding spills grow. |
-
-**Reader: was replay blocked, or was the instance starved?**
-
-| Metric | What it tells you |
-|---|---|
-| ★ `AuroraReplicaLag` | Use the reader's instance dimension. `AuroraReplicaLagMaximum` and `AuroraReplicaLagMinimum` are reported on the writer. |
-| ★ `EngineUptime` | Drops to near zero when the instance restarts. A reset at the spike means Aurora restarted the lagging reader. |
-| ★ `CPUUtilization`, `DBLoad`, `DBLoadCPU`, `DBLoadNonCPU` | Reader CPU saturation and active sessions. |
-| `FreeableMemory`, `SwapUsage`, `AuroraEstimatedSharedMemoryBytes` | Memory pressure. `SwapUsage` isn't published for db.r7g classes. |
-| `BufferCacheHitRatio`, `ReadIOPS`, `ReadLatency`, `DiskQueueDepth` | Cache misses forcing storage reads. |
-| `StorageNetworkReceiveThroughput` | Bytes per second pulled from storage; rises with cache misses. |
-| `FreeLocalStorage` | Local temp-file space. A sharp drop means big sorts or hashes spilling to disk on the reader. |
-| `DatabaseConnections`, `Deadlocks` | Connection surges and deadlocks. |
-
-**RDS Proxy (reader side).** Use the `ProxyName`, `TargetGroup`, `TargetRole` dimensions with `TargetRole = READ_ONLY`.
-
-| Metric | Statistic | What it tells you |
-|---|---|---|
-| ★ `DatabaseConnectionsCurrentlyInTransaction` | Sum | Connections with an open transaction. A climb before the lag spike points to long reader transactions blocking replay. |
-| `DatabaseConnectionsCurrentlySessionPinned` | Sum | Pinned sessions. Expect this to be high with Rails, which issues `SET` commands on connect. |
-| `DatabaseConnectionsBorrowLatency` | Average | Time to get a database connection from the pool. Rises when the pool is exhausted. |
-| `ClientConnections`, `DatabaseConnections` | Sum | Connection surges, for example after a deploy. |
-
-> **Caution:** `QueryDatabaseResponseLatency`, `QueryResponseLatency` and `QueryRequests` don't include PostgreSQL traffic that uses the extended query protocol. Rails' `pg` adapter uses it for prepared statements and parameterized queries, so these metrics may undercount or show nothing for your app. Don't read a flat line there as "the database was fine."
-
-### Performance Insights counters (1-minute, 7-day retention)
-
-These aren't in CloudWatch, but you can add them to the Performance Insights or Database Insights dashboard for each instance, or pull them with the CLI. Several map directly onto the causes of lag.
-
-| Counter | Instance | What it tells you |
-|---|---|---|
-| ★ `db.Transactions.oldest_reader_feedback_xid_age` | Writer (check both) | Age of the oldest long-running transaction on an Aurora reader. The most direct signal for "a reader transaction is blocking things." |
-| ★ `db.SQL.tup_updated`, `db.SQL.tup_inserted`, `db.SQL.tup_deleted` | Writer | Rows changed per second. Pins down a write burst and whether it was updates, inserts or deletes. |
-| `db.Checkpoint.checkpoints_req` | Writer | Forced checkpoints, which lead to bursts of full-page writes. |
-| ★ `db.Transactions.oldest_active_logical_replication_slot_xid_age`, `db.Transactions.oldest_inactive_logical_replication_slot_xid_age` | Writer | Age of the oldest transaction held by an active or inactive logical slot. An inactive slot with a growing age suggests an abandoned or stalled consumer. |
-| ★ `db.state.idle_in_transaction_count`, `db.state.idle_in_transaction_max_time` | Reader | Sessions holding a transaction open while doing nothing, and the longest such session in seconds. |
-| `db.Transactions.active_transactions`, `db.Transactions.blocked_transactions`, `db.Locks.num_blocked_sessions` | Reader | Transaction pile-ups and blocking. |
-| `db.Temp.temp_bytes` | Reader | Temp-file spills from big sorts or hashes. |
-| `db.IO.storage_blks_read` | Reader | Blocks read from Aurora storage, meaning cache misses. |
-| `os.cpuUtilization.steal`, `os.loadAverageMinute.one`, `os.swap.in`, `os.memory.outOfMemoryKillCount` | Reader | OS-level starvation. |
-
-```bash
-aws pi get-resource-metrics --service-type RDS \
-  --identifier <writer-DbiResourceId> \
-  --start-time 2026-09-30T14:00:00Z --end-time 2026-09-30T15:00:00Z \
-  --period-in-seconds 60 \
-  --metric-queries '[{"Metric":"db.SQL.tup_updated.avg"},
-                     {"Metric":"db.SQL.tup_deleted.avg"},
-                     {"Metric":"db.Transactions.oldest_reader_feedback_xid_age.max"}]'
-```
-
-The identifier is the instance's `DbiResourceId` (it starts with `db-`), not its name. Run `aws rds describe-db-instances --query 'DBInstances[].[DBInstanceIdentifier,DbiResourceId]'` to find it.
-
-### Metrics to skip
-
-| Metric | Why |
-|---|---|
-| `TransactionLogsGeneration` | RDS for PostgreSQL only. Aurora doesn't publish it. Use `WriteIOPS` and `WriteThroughput` instead. |
-| `DMLThroughput`, `DDLThroughput`, `ActiveTransactions`, `BlockedTransactions` | Aurora MySQL only. Use the Performance Insights counters above instead. |
-
-### How to read the graph
-
-- **Writer `WriteIOPS` and `db.SQL.tup_*` jump first, then lag follows:** a write burst. Find the job, migration or statement with Performance Insights Top SQL on the writer and the §4 log queries.
-- **`TransactionLogsDiskUsage` or `OldestReplicationSlotLag` rises at the same time as the app's problems:** the logical replication consumer is involved, either decoding a big transaction or falling behind. Work through §8.
-- **Writer is flat, but `oldest_reader_feedback_xid_age`, `idle_in_transaction_max_time` or proxy `DatabaseConnectionsCurrentlyInTransaction` climbs before the lag:** long reader transactions are blocking replay.
-- **Writer is flat, and reader CPU, memory, `ReadIOPS` or `FreeLocalStorage` spikes:** the reader is starved. Check the instance class and the reader's top SQL.
-- **Reader `EngineUptime` resets at the spike:** Aurora restarted the reader for falling too far behind. Confirm in RDS events below.
-- **Lag stays low but users see stale data:** read routing, covered in §6.
-
-Also check RDS events for reader restarts. Aurora restarts a reader that falls too far behind:
-
-```bash
-aws rds describe-events --source-identifier <reader-id> \
-  --source-type db-instance --duration 10080
-```
+Run the same command with `AuroraReplicaLag` and the reader ID. For each spike, use the **onset** rather than the peak, and look at roughly 15 minutes before to 10 minutes after.
 
 ---
 
-## 4. CloudWatch Logs Insights: the queries that matter
+## 3. The CDC lead: logical replication
 
-Use the log group `/aws/rds/cluster/<cluster>/postgresql`. Set the time picker to your window and query **both** instance log streams.
+### Three likely explanations
 
-**1. Incident timeline.** Start here:
+1. **A large transaction is being decoded.** Logical decoding can't send a transaction until it commits, so a big batch job or data migration makes WAL pile up until the commit. The same write burst can also cause reader lag. Here the metric is a symptom of the burst rather than the cause, but it gives a precise timestamp for it.
+2. **The consumer fell behind or disconnected.** A DMS task, Debezium connector, zero-ETL integration or logical subscriber slows down or restarts, and WAL is retained until it catches up. Decoding and the catch-up afterwards both add CPU and IO load on the writer.
+3. **Decoding spills to disk.** Transactions bigger than `logical_decoding_work_mem` (64 MB by default) are spilled to local files while they're decoded, which adds writer IO and CPU load.
 
-```
-fields @timestamp, @logStream, @message
-| filter @message like /conflict with recovery|canceling statement|terminating connection|still waiting for|acquired .*Lock|AccessExclusiveLock|automatic (aggressive )?vacuum|statement: (ALTER|CREATE|DROP|TRUNCATE|VACUUM|REINDEX|CLUSTER|REFRESH)|duration: \d{4,}|checkpoint (starting|complete)|FATAL|PANIC/
-| sort @timestamp asc
-| limit 1000
-```
+The shape of the `TransactionLogsDiskUsage` graph helps tell them apart:
 
-**2. Volume per minute per instance.** The first minute where counts rise usually identifies the trigger:
+| Shape | Likely explanation |
+|---|---|
+| Sharp spike that drains quickly | A big transaction (explanation 1, possibly 3) |
+| Sawtooth | The consumer works in batches or keeps reconnecting |
+| Steady climb | The consumer is stopped or disconnected (explanation 2) |
 
-```
-fields @timestamp, @logStream
-| filter @message like /ERROR|FATAL|conflict|canceling|waiting|vacuum|duration:/
-| stats count(*) as events by bin(1m), @logStream
-| sort @timestamp asc
-```
+### Identify the consumer
 
-**3. Slow SQL by Rails job or controller.** This needs the query log tags from §7:
-
-```
-fields @timestamp, @logStream, @message
-| parse @message /duration: (?<dur_ms>[\d\.]+) ms/
-| parse @message /job='(?<job>[^']+)'/
-| parse @message /controller='(?<ctrl>[^']+)'/
-| filter ispresent(dur_ms)
-| stats count(*) as n, max(dur_ms) as max_ms by job, ctrl, @logStream
-| sort max_ms desc
-```
-
-Durations are logged at completion, so subtract each duration from its timestamp to see whether the statement was running when lag began.
-
-**4. Reader OS pressure** (`RDSOSMetrics` log group):
-
-```
-fields @timestamp, cpuUtilization.total, cpuUtilization.steal,
-       loadAverageMinute.one, memory.free, swap.in, swap.out
-| filter instanceID = "<reader-id>"
-| sort @timestamp asc
-```
-
-Watch for CPU pinned near 100%, a load average above the vCPU count, or swap activity.
-
-**5. Logical replication activity** (writer log stream). Look for consumers disconnecting and reconnecting, or logical decoding starting, at the spike times:
-
-```
-fields @timestamp, @logStream, @message
-| filter @message like /logical decoding|replication slot|walsender|START_REPLICATION|could not send data|terminating walsender|replication connection|snapshot/
-| sort @timestamp asc
-| limit 500
-```
-
-If you only have downloaded log files, grep them with the same patterns (adjust for any time zone difference in the log prefix):
-
-```bash
-grep -E "2026-09-30 14:(2|3)" reader_*.log | grep -Ei "conflict|cancel|waiting|vacuum|duration|statement:|FATAL"
-```
-
----
-
-## 5. Key SQL
-
-### Writer
-
-Per-replica status, which is Aurora-specific. Run it repeatedly during a live spike:
+Who is connected right now, and how far behind each consumer is:
 
 ```sql
-SELECT server_id, replica_lag_in_msec, cur_replay_latency_in_usec,
-       log_stream_speed_in_kib_per_second, feedback_xmin,
-       pending_read_ios, cpu, last_transport_error, last_update_timestamp
-FROM aurora_replica_status()
-ORDER BY server_id;
+SELECT pid, application_name, client_addr, state, backend_start,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn))  AS send_lag,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn)) AS flush_lag_bytes,
+       write_lag, flush_lag, replay_lag
+FROM pg_stat_replication;
 ```
 
-Top redo producers. The counters are cumulative, so this works after the fact:
+Which slots exist, and how much WAL each one is holding:
+
+```sql
+SELECT slot_name, slot_type, plugin, database, active, active_pid,
+       wal_status, safe_wal_size,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))         AS retained_wal,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS unconfirmed
+FROM pg_replication_slots
+ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC;
+```
+
+The `slot_name`, `plugin`, `application_name` and `client_addr` together usually identify the owner. Confirm with the team, and check AWS-side consumers directly:
+
+```bash
+aws dms describe-replication-tasks \
+  --query 'ReplicationTasks[].[ReplicationTaskIdentifier,Status,MigrationType]' --output table
+aws rds describe-integrations \
+  --query 'Integrations[].[IntegrationName,Status,SourceArn]' --output table
+```
+
+### Check for decoding spills
+
+This is the key check for explanation 3. The counters are cumulative, so note the values, then compare them after the next spike:
+
+```sql
+SELECT slot_name, spill_txns, spill_count, pg_size_pretty(spill_bytes) spill,
+       stream_txns, pg_size_pretty(stream_bytes) streamed,
+       total_txns, pg_size_pretty(total_bytes) total, stats_reset
+FROM pg_stat_replication_slots;
+```
+
+### Find the big transaction
+
+Over the long term, the statements that generate the most WAL:
 
 ```sql
 SELECT queryid, calls, pg_size_pretty(wal_bytes) wal, wal_fpi, rows,
@@ -275,18 +163,86 @@ ORDER BY wal_bytes DESC
 LIMIT 20;
 ```
 
-Sessions holding or waiting on ACCESS EXCLUSIVE locks, usually migrations:
+During a live spike, the long-running write transactions on the writer:
 
 ```sql
-SELECT l.pid, l.relation::regclass, l.mode, l.granted,
-       a.state, now() - a.query_start dur, left(a.query,120)
-FROM pg_locks l JOIN pg_stat_activity a USING (pid)
-WHERE l.mode = 'AccessExclusiveLock';
+SELECT pid, application_name, state,
+       now() - xact_start AS xact_age,
+       coalesce(substring(query from 'job=''([^'']+)'''),
+                substring(query from 'controller=''([^'']+)''')) AS source,
+       left(query,150) q
+FROM pg_stat_activity
+WHERE backend_xid IS NOT NULL
+ORDER BY xact_start
+LIMIT 15;
 ```
 
-### Reader
+For past spikes, use Performance Insights Top SQL on the writer, the `db.SQL.tup_*` counters, and the Logs Insights queries in §5. Once query log tags are on (§8), the `source` column names the Rails job or controller.
 
-Replay conflicts. Any non-zero `confl_lock`, `confl_snapshot` or `confl_bufferpin` confirms that reader queries are blocking replay:
+### Metrics to graph with the lead
+
+- **Writer CloudWatch:** `TransactionLogsDiskUsage`, `ReplicationSlotDiskUsage`, `OldestReplicationSlotLag`, `FreeLocalStorage`, `CPUUtilization`, `WriteIOPS`, `WriteThroughput`
+- **Writer Performance Insights:** `db.Transactions.oldest_active_logical_replication_slot_xid_age`, `db.Transactions.oldest_inactive_logical_replication_slot_xid_age`, and `db.SQL.tup_updated`, `tup_inserted` and `tup_deleted`
+- **If the consumer is DMS** (`AWS/DMS` namespace, per task): `CDCLatencySource`, `CDCLatencyTarget`, `CDCIncomingChanges`, plus the task's CloudWatch logs
+
+> **Caution:** Don't drop a replication slot until you know who owns it. Dropping it breaks that consumer's change stream, and the consumer usually needs a full resync afterwards. If a slot is truly abandoned (`active = false` and nobody claims it), dropping it is the fix.
+
+---
+
+## 4. Reader lag: metrics and SQL
+
+Use this section when reader `AuroraReplicaLag` spikes, with or without the CDC metric.
+
+### CloudWatch metrics (1-minute Maximum)
+
+| Instance | Metric | What it tells you |
+|---|---|---|
+| Writer | `WriteIOPS`, `WriteThroughput` | The redo rate on Aurora: storage write records per second, and bytes per second. A jump just before lag means a write burst. |
+| Writer | `MaximumUsedTransactionIDs` | A rising transaction ID age means anti-wraparound vacuums are coming, which produce heavy redo. |
+| Reader | `AuroraReplicaLag` | Use the reader's instance dimension. |
+| Reader | `EngineUptime` | Resets when the instance restarts. A reset at a spike means Aurora restarted the lagging reader. |
+| Reader | `CPUUtilization`, `DBLoad` | CPU saturation and active sessions. |
+| Reader | `FreeableMemory`, `BufferCacheHitRatio`, `ReadIOPS`, `ReadLatency` | Memory pressure and cache misses. |
+| Reader | `FreeLocalStorage` | A sharp drop means big sorts or hashes spilling to disk. |
+| RDS Proxy (`TargetRole = READ_ONLY`, Sum) | `DatabaseConnectionsCurrentlyInTransaction` | Connections with an open transaction. A climb before the spike points to long reader transactions. |
+
+> **Caution:** RDS Proxy's `QueryDatabaseResponseLatency`, `QueryResponseLatency` and `QueryRequests` don't include PostgreSQL traffic that uses the extended query protocol, which Rails' `pg` adapter uses for many queries. A flat line there doesn't mean the database was fine.
+
+**Performance Insights counters on the reader** (1-minute, 7-day retention): `db.state.idle_in_transaction_max_time`, `db.Transactions.blocked_transactions`, `db.Temp.temp_bytes` and `os.cpuUtilization.steal`. On the writer, `db.Transactions.oldest_reader_feedback_xid_age` shows the age of the oldest long-running transaction on a reader.
+
+To pull counters with the CLI, use the instance's `DbiResourceId`, which starts with `db-` (`aws rds describe-db-instances --query 'DBInstances[].[DBInstanceIdentifier,DbiResourceId]'`):
+
+```bash
+aws pi get-resource-metrics --service-type RDS --identifier <DbiResourceId> \
+  --start-time <start> --end-time <end> --period-in-seconds 60 \
+  --metric-queries '[{"Metric":"db.SQL.tup_updated.avg"},
+                     {"Metric":"db.Transactions.oldest_reader_feedback_xid_age.max"}]'
+```
+
+### How to read the reader graphs
+
+- **Writer `WriteIOPS` jumps first, then lag follows:** a write burst. Find the statement using §3.
+- **Writer is flat, but reader transaction age or proxy in-transaction connections climb first:** long reader transactions are blocking replay.
+- **Writer is flat, and reader CPU, memory or IO spikes:** the reader is starved. Check its instance class and its Top SQL.
+- **`EngineUptime` resets:** Aurora restarted the reader. Confirm in RDS events:
+
+```bash
+aws rds describe-events --source-identifier <reader-id> --source-type db-instance --duration 10080
+```
+
+### SQL
+
+Per-replica status, run on the writer. Aurora-specific; run it repeatedly during a live spike:
+
+```sql
+SELECT server_id, replica_lag_in_msec, cur_replay_latency_in_usec,
+       log_stream_speed_in_kib_per_second, feedback_xmin,
+       pending_read_ios, cpu, last_transport_error, last_update_timestamp
+FROM aurora_replica_status()
+ORDER BY server_id;
+```
+
+Replay conflicts, run on the reader. Any non-zero `confl_lock`, `confl_snapshot` or `confl_bufferpin` confirms that reader queries are blocking replay:
 
 ```sql
 SELECT d.datname, c.confl_lock, c.confl_snapshot, c.confl_bufferpin,
@@ -294,7 +250,7 @@ SELECT d.datname, c.confl_lock, c.confl_snapshot, c.confl_bufferpin,
 FROM pg_stat_database_conflicts c JOIN pg_stat_database d USING (datid);
 ```
 
-Long transactions, attributed to Rails jobs and controllers through the query log tags:
+Long transactions on the reader, attributed to Rails jobs and controllers once query log tags are on:
 
 ```sql
 SELECT pid, application_name, state,
@@ -308,35 +264,117 @@ ORDER BY xact_start NULLS LAST
 LIMIT 25;
 ```
 
-More queries are in the appendix.
+Sessions holding or waiting on ACCESS EXCLUSIVE locks, run on the writer. Usually migrations:
+
+```sql
+SELECT l.pid, l.relation::regclass, l.mode, l.granted,
+       a.state, now() - a.query_start dur, left(a.query,120)
+FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+WHERE l.mode = 'AccessExclusiveLock';
+```
 
 ---
 
-## 6. Rails-specific causes, by symptom
+## 5. CloudWatch Logs Insights
 
-### Stale data, normal lag metric
-- **Jobs enqueued in `after_save` or `after_create`** run before the transaction commits, or read the replica milliseconds later. Fix: enqueue in `after_commit`, and have jobs that act on fresh writes read from the primary (`connected_to(role: :writing)`).
-- **`DatabaseSelector` only protects web requests** for its `delay` window (2 seconds by default). Jobs, other processes and clients without the session cookie get no protection.
+Use the log group `/aws/rds/cluster/<cluster>/postgresql`. Set the time picker to the spike window and query **both** instance log streams so events interleave in order.
 
-### Real lag from write bursts
-- **Data migrations and Rake tasks** using `update_all`, `delete_all`, `insert_all` or large `in_batches` runs. Fix: smaller batches with a short sleep between them.
-- **`touch: true` chains and `counter_cache` on hot rows** quietly multiply writes.
-- **Postgres-backed job queues** (GoodJob, Que, Solid Queue) churn rows constantly, which drives heavy vacuum and redo. Check their tables first in the vacuum log entries.
+**1. Incident timeline.** Start here. It covers DDL, vacuum, locks, conflicts, slow SQL and replication events:
 
-### Real lag from blocked replay
-- **Migrations taking ACCESS EXCLUSIVE locks:** `add_index` without `algorithm: :concurrently`, `change_column`, and new foreign keys or constraints. Rails wraps migrations in a transaction, so locks are held longer. Fix: use `strong_migrations` and set `lock_timeout` in migrations.
-- **Long reader transactions:** reports, exports, `find_each` loops, or `transaction do` blocks that make HTTP calls.
+```
+fields @timestamp, @logStream, @message
+| filter @message like /conflict with recovery|canceling statement|terminating connection|still waiting for|acquired .*Lock|automatic (aggressive )?vacuum|statement: (ALTER|CREATE|DROP|TRUNCATE|VACUUM|REINDEX|CLUSTER|REFRESH)|duration: \d{4,}|checkpoint (starting|complete)|logical decoding|replication slot|walsender|START_REPLICATION|could not send data|FATAL|PANIC/
+| sort @timestamp asc
+| limit 1000
+```
 
-### Connection-layer gotchas
-- **PgBouncer in transaction mode** needs `prepared_statements: false`, unless you're on PgBouncer 1.21 or later with `max_prepared_statements` set. Advisory locks and `LISTEN/NOTIFY` (GoodJob) don't work reliably through it.
-- **RDS Proxy pins sessions** because Rails issues `SET` commands on every new connection. A high `DatabaseConnectionsCurrentlySessionPinned` is expected. Pinning isn't a lag cause by itself, but long transactions keep their connections open.
-- **Put timeouts on the database role, not in `database.yml` `variables:`.** Through the poolers they're either lost or add more pinning.
+**2. Volume per minute per instance.** The first minute where counts rise usually identifies the trigger:
+
+```
+fields @timestamp, @logStream
+| filter @message like /ERROR|FATAL|conflict|canceling|waiting|vacuum|duration:|walsender|logical decoding/
+| stats count(*) as events by bin(1m), @logStream
+| sort @timestamp asc
+```
+
+**3. Slow SQL by Rails job or controller.** This needs the query log tags from §8:
+
+```
+fields @timestamp, @logStream, @message
+| parse @message /duration: (?<dur_ms>[\d\.]+) ms/
+| parse @message /job='(?<job>[^']+)'/
+| parse @message /controller='(?<ctrl>[^']+)'/
+| filter ispresent(dur_ms)
+| stats count(*) as n, max(dur_ms) as max_ms by job, ctrl, @logStream
+| sort max_ms desc
+```
+
+Durations are logged at completion, so subtract each duration from its timestamp to see when the statement started. A long write that started before the spike and finished at its peak fits explanation 1 in §3.
+
+**4. OS pressure** (`RDSOSMetrics` log group; use the writer or reader instance ID):
+
+```
+fields @timestamp, cpuUtilization.total, cpuUtilization.steal,
+       loadAverageMinute.one, memory.free, swap.in, swap.out
+| filter instanceID = "<instance-id>"
+| sort @timestamp asc
+```
+
+If you only have downloaded log files, grep them with the same patterns (adjust for any time zone difference in the log prefix):
+
+```bash
+grep -E "<YYYY-MM-DD HH:M>" *.log | grep -Ei "conflict|cancel|waiting|vacuum|duration|statement:|walsender|logical decoding|FATAL"
+```
 
 ---
 
-## 7. Set the trap for next time
+## 6. Questions for the team
 
-### Rails query log tags (biggest single win)
+**CDC consumer**
+1. What consumes logical replication from this cluster: DMS, Debezium/Kafka, a zero-ETL integration, a logical subscriber?
+2. Did it restart, error or fall behind at the spike times? Check DMS task logs, Kafka Connect logs or the integration's status page.
+3. Could any slot be abandoned, for example left over from an old migration?
+
+**App and jobs**
+
+4. What exactly does the app team see (slow responses, timeouts, stale data) and on which code paths?
+5. What deployed or ran on a schedule at the spike times? Ask about migrations, Rake tasks, and cron jobs (sidekiq-cron, whenever, GoodJob cron).
+6. Which job system do you use? Do jobs read from the replica, and are they enqueued in `after_commit`?
+7. Is Rails multi-database role switching used, and what's the `DatabaseSelector` `delay`?
+8. Do you use `strong_migrations`, and `algorithm: :concurrently` for indexes?
+
+**Infrastructure**
+
+9. Is the reader the same instance class as the writer?
+10. Is `prepared_statements: false` set for the PgBouncer connection?
+
+---
+
+## 7. Rails-specific causes
+
+**Large transactions, which feed both reader lag and CDC spikes**
+- Data migrations and Rake tasks using `update_all`, `delete_all`, `insert_all` or large `in_batches` runs inside one transaction.
+- `touch: true` chains and `counter_cache` on hot rows, which quietly multiply writes.
+- Postgres-backed job queues (GoodJob, Que, Solid Queue), which churn rows constantly. That drives heavy vacuum and redo, and every change is also decoded for CDC.
+
+**Blocked replay on the reader**
+- Migrations taking ACCESS EXCLUSIVE locks: `add_index` without `algorithm: :concurrently`, `change_column`, and new foreign keys or constraints. Rails wraps migrations in a transaction, so locks are held longer.
+- Long reader transactions: reports, exports, `find_each` loops, or `transaction do` blocks that make HTTP calls.
+
+**Stale data with a normal lag metric**
+- Jobs enqueued in `after_save` or `after_create` run before the commit, or read the replica milliseconds later.
+- `DatabaseSelector` only protects web requests, and only for its `delay` window (2 seconds by default).
+
+**Connection layer**
+- PgBouncer in transaction mode needs `prepared_statements: false`, unless you're on PgBouncer 1.21 or later with `max_prepared_statements` set.
+- RDS Proxy pins sessions because Rails issues `SET` commands on every new connection. Expect a high `DatabaseConnectionsCurrentlySessionPinned`.
+- Put timeouts on the database role, not in `database.yml` `variables:`. Through the poolers they're either lost or add more pinning.
+
+---
+
+## 8. Set the trap for the next spike
+
+**Rails query log tags.** This is the biggest single win: every query then names the job or controller that sent it.
 
 ```ruby
 # config/application.rb  (Rails 7+; use the marginalia gem on older versions)
@@ -345,123 +383,65 @@ config.active_record.query_log_tags = [:application, :controller, :action, :job]
 config.active_record.query_log_tags_format = :sqlcommenter
 ```
 
-Every query then carries a comment like `/*job='NightlyPurgeJob'*/`, which appears in `pg_stat_activity`, Performance Insights and the Postgres logs. `pg_stat_statements` ignores comments when grouping queries, so use `pg_stat_activity` and the logs for attribution.
+Also set a distinct `application_name` per process type (web, sidekiq, rake) in `database.yml`.
 
-Also set a distinct `application_name` per process type (web, sidekiq, rake) in `database.yml`, and check that it comes through RDS Proxy before relying on it on the reader.
-
-### Database parameters (dynamic, no reboot)
+**Database parameters.** These are dynamic, so no reboot is needed:
 
 | Parameter | Value | Why |
 |---|---|---|
-| `log_min_duration_statement` | 1000–5000 ms | long queries |
+| `log_min_duration_statement` | 1000–5000 ms | long queries, including the big write |
 | `log_lock_waits` | on | lock contention around migrations |
 | `log_autovacuum_min_duration` | 10s | which tables vacuum, and when |
 | `log_statement` | `ddl` | migrations |
 | `log_checkpoints` | on | full-page-write bursts |
+| `log_replication_commands` | on | consumer connects, disconnects and replication commands |
 | `rds.log_retention_period` | 10080 | 7 days of log files on the instance |
 
 Also enable PostgreSQL log export to CloudWatch Logs on the cluster.
 
-### Role-level timeouts for the reader
+**Role-level timeouts for the reader:**
 
 ```sql
 ALTER ROLE app_reader SET statement_timeout = '30s';
 ALTER ROLE app_reader SET idle_in_transaction_session_timeout = '60s';
 ```
 
-### Alarm
+**Alarms** (1-minute Maximum, with notification):
 
-Create CloudWatch alarms that notify you, then run the §5 and §8 SQL while the spike is happening:
+- writer `TransactionLogsDiskUsage`, above a threshold set from its normal baseline
+- reader `AuroraReplicaLag`, above something like 1000 ms
+- writer `OldestReplicationSlotLag`, to catch a stalled consumer early
 
-- `AuroraReplicaLag` on the reader: Maximum, 1 minute, above something like 1000 ms.
-- `TransactionLogsDiskUsage` on the writer: Maximum, 1 minute, above a threshold set from its normal baseline.
-- Optionally, `OldestReplicationSlotLag` on the writer, to catch a stalled consumer early.
-
----
-
-## 8. Logical replication / CDC (current lead)
-
-A real value in `TransactionLogsDiskUsage` means something consumes changes from the writer through a logical replication slot. The metric rises when a slot holds WAL that its consumer hasn't confirmed yet.
-
-### Three likely explanations
-
-1. **A large transaction is being decoded.** Logical decoding can't send a transaction until it commits, so a big batch job or data migration makes WAL pile up until the commit. The same burst can also cause reader lag and app slowness. Here the metric is a symptom of the burst rather than the cause, but it gives a precise timestamp for it.
-2. **The consumer fell behind or disconnected.** A DMS task, Debezium connector, zero-ETL integration or logical subscriber slows down or restarts, and WAL is retained until it catches up. The decoding and the catch-up afterwards both add CPU and IO load on the writer.
-3. **Decoding spills to disk.** Transactions bigger than `logical_decoding_work_mem` are spilled to local files while they're decoded. That shows up as writer IO and CPU load at the same time as the metric spike.
-
-### Reading the shape of `TransactionLogsDiskUsage`
-
-| Shape | Likely explanation |
-|---|---|
-| Sharp spike that drains quickly | A big transaction (explanation 1 or 3) |
-| Sawtooth | The consumer works in batches or keeps reconnecting |
-| Steady climb | The consumer is stopped or disconnected (explanation 2) |
-
-### Metrics to graph with it
-
-- **Writer CloudWatch:** `TransactionLogsDiskUsage`, `ReplicationSlotDiskUsage`, `OldestReplicationSlotLag`, `FreeLocalStorage`, `CPUUtilization`, `WriteThroughput`
-- **Writer Performance Insights:** `db.Transactions.oldest_active_logical_replication_slot_xid_age` and `oldest_inactive_logical_replication_slot_xid_age`, plus walsender (logical decoding) processes among the top waits
-- **If the consumer is DMS** (`AWS/DMS` namespace, per task): `CDCLatencySource`, `CDCLatencyTarget`, `CDCIncomingChanges`
-- **Reader:** `AuroraReplicaLag`, to see whether reader lag rises with the slot metrics or is a separate problem
-- **Logs:** Logs Insights query 5 in §4
-
-### SQL on the writer
-
-Which slots exist, and how much WAL each one is holding:
-
-```sql
-SELECT slot_name, slot_type, plugin, database, active, active_pid,
-       wal_status, safe_wal_size,
-       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))         AS retained_wal,
-       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS unconfirmed,
-       age(catalog_xmin) AS catalog_xmin_age
-FROM pg_replication_slots
-ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC;
-```
-
-Whether decoding is spilling large transactions to disk. This is the key check for explanation 3. The counters are cumulative, so look for non-zero and growing `spill_*` values:
-
-```sql
-SELECT slot_name, spill_txns, spill_count, pg_size_pretty(spill_bytes) spill,
-       stream_txns, pg_size_pretty(stream_bytes) streamed,
-       total_txns, pg_size_pretty(total_bytes) total, stats_reset
-FROM pg_stat_replication_slots;
-```
-
-Who is connected and how far behind they are. `application_name` and `client_addr` usually identify the consumer:
-
-```sql
-SELECT pid, application_name, client_addr, state, backend_start,
-       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn))  AS send_lag,
-       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn)) AS flush_lag_bytes,
-       write_lag, flush_lag, replay_lag
-FROM pg_stat_replication;
-```
-
-Relevant settings:
-
-```sql
-SELECT name, setting, unit FROM pg_settings
-WHERE name IN ('rds.logical_replication','wal_level','logical_decoding_work_mem',
-               'max_slot_wal_keep_size','max_replication_slots','max_wal_senders');
-```
-
-> **Caution:** Don't drop a replication slot to "clean up" until you know who owns it. Dropping it breaks that consumer's change stream, and the consumer usually needs a full resync afterwards. If a slot is truly abandoned (`active = false` and nobody claims it), dropping it is the fix.
+When an alarm fires, run the §3 SQL on the writer and the §4 SQL on the reader while the spike is happening. Note the `pg_stat_replication_slots` counters before and after.
 
 ---
 
 ## 9. Fixes, once the cause is confirmed
 
-- **Undersized reader:** match the reader instance class to the writer.
-- **Write bursts:** batch DML into smaller commits and schedule heavy jobs away from peak read traffic. Smaller transactions also decode and stream to CDC consumers more smoothly.
-- **Migrations:** use `strong_migrations`, `algorithm: :concurrently`, and `lock_timeout`.
-- **Stale reads:** enqueue jobs in `after_commit` and send read-after-write paths to the primary.
-- **Long reader transactions:** role-level `statement_timeout` and `idle_in_transaction_session_timeout`.
-- **Logical replication consumer:**
-  - Fix or scale the consumer that falls behind (DMS task size, connector settings).
-  - Drop slots confirmed to be abandoned.
-  - Set `max_slot_wal_keep_size` as a guardrail, so a stalled consumer can't retain WAL without limit.
-  - If decoding spills are high, consider raising `logical_decoding_work_mem`, or use streaming of in-progress transactions if the consumer supports it.
+**CDC consumer**
+- Fix or scale the consumer that falls behind (DMS task size, connector settings).
+- Drop slots confirmed to be abandoned.
+- Set `max_slot_wal_keep_size` as a guardrail, so a stalled consumer can't retain WAL without limit.
+- If decoding spills are high, consider raising `logical_decoding_work_mem`, or use streaming of in-progress transactions if the consumer supports it.
+
+**Large transactions:** batch DML into smaller commits and schedule heavy jobs away from peak traffic. This helps both reader lag and CDC.
+
+**Migrations:** use `strong_migrations`, `algorithm: :concurrently` and `lock_timeout`.
+
+**Long reader transactions:** role-level `statement_timeout` and `idle_in_transaction_session_timeout`.
+
+**Stale reads:** enqueue jobs in `after_commit`, and send read-after-write paths to the primary.
+
+**Undersized reader:** match the reader instance class to the writer.
+
+---
+
+## Findings log
+
+| Spike time (UTC) | `TransactionLogsDiskUsage` peak / shape | Reader lag peak | Writer CPU / load | Consumer state | Statement / job running | App symptom | Notes |
+|---|---|---|---|---|---|---|---|
+| | | | | | | | |
+| | | | | | | | |
 
 ---
 
@@ -474,6 +454,14 @@ CREATE TEMP TABLE wal_sample AS SELECT now() ts, pg_current_wal_lsn() lsn;
 SELECT pg_sleep(60);
 SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), lsn)) AS wal_per_min
 FROM wal_sample;
+```
+
+Replication-related settings on the writer:
+
+```sql
+SELECT name, setting, unit FROM pg_settings
+WHERE name IN ('rds.logical_replication','logical_decoding_work_mem','max_slot_wal_keep_size',
+               'max_replication_slots','max_wal_senders','log_replication_commands');
 ```
 
 Active vacuums on the writer:
@@ -495,7 +483,7 @@ ORDER BY age(c.relfrozenxid) DESC
 LIMIT 20;
 ```
 
-Wait events on the reader right now:
+Wait events right now (either instance):
 
 ```sql
 SELECT wait_event_type, wait_event, count(*)
@@ -503,7 +491,7 @@ FROM pg_stat_activity WHERE state <> 'idle'
 GROUP BY 1,2 ORDER BY 3 DESC;
 ```
 
-Settings that govern how long replay waits behind reader queries:
+Reader settings that govern how long replay waits behind queries:
 
 ```sql
 SELECT name, setting, unit FROM pg_settings
@@ -512,4 +500,3 @@ WHERE name IN ('max_standby_streaming_delay','hot_standby_feedback',
 ```
 
 > **Note:** Column names and functions can vary slightly by Aurora minor version. Run `\df aurora_*` or check the docs for 16.13 if a column errors.
-> 
