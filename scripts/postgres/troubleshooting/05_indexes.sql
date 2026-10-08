@@ -62,3 +62,20 @@ LIMIT 25;
 SELECT p.pid, p.relid::regclass AS table, p.index_relid::regclass AS index,
        p.phase, p.blocks_done, p.blocks_total, p.tuples_done, p.tuples_total
 FROM pg_stat_progress_create_index p;
+
+-- 5.7 Missing Indexes
+SELECT
+    schemaname,
+    relname AS table_name,
+    seq_scan,
+    seq_tup_read,
+    idx_scan,
+    CASE WHEN seq_scan > 0
+         THEN seq_tup_read / seq_scan
+         ELSE 0
+    END AS avg_rows_per_seq_scan,
+    n_live_tup
+FROM pg_stat_user_tables
+WHERE seq_scan > 0
+ORDER BY seq_tup_read DESC
+LIMIT 20;
