@@ -65,11 +65,11 @@ ORDER BY age DESC;
 
 -- 4.8 Estimated table bloat (heuristic, based on stats; install pgstattuple for exact)
 SELECT current_database() AS db, schemaname, tblname,
-       pg_size_pretty(bs * tblpages) AS real_size,
-       pg_size_pretty(bs * GREATEST(tblpages - est_tblpages, 0)) AS bloat_size,
+       pg_size_pretty((bs * tblpages)::bigint) AS real_size,
+       pg_size_pretty((bs * GREATEST(tblpages - est_tblpages, 0))::bigint) AS bloat_size,
        round(100 * GREATEST(tblpages - est_tblpages, 0)::numeric / NULLIF(tblpages, 0), 1) AS bloat_pct
 FROM (
-  SELECT ceil(reltuples / ((bs - page_hdr) / NULLIF(tpl_size, 0))) + ceil(toasttuples / 4) AS est_tblpages,
+  SELECT (ceil(reltuples / ((bs - page_hdr) / NULLIF(tpl_size, 0))) + ceil(toasttuples / 4))::numeric AS est_tblpages,
          tblpages, bs, schemaname, tblname
   FROM (
     SELECT n.nspname AS schemaname, c.relname AS tblname, c.reltuples, c.relpages AS tblpages,
