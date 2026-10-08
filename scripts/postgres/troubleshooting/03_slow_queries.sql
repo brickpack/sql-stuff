@@ -9,7 +9,7 @@ SELECT queryid, calls,
        round(mean_exec_time::numeric, 2) AS mean_ms,
        round(stddev_exec_time::numeric, 2) AS stddev_ms,
        rows,
-       round(100 * total_exec_time / sum(total_exec_time) OVER (), 2) AS pct_total,
+       round((100 * total_exec_time / sum(total_exec_time) OVER ())::numeric, 2) AS pct_total,
        left(query, 200) AS query
 FROM pg_stat_statements
 ORDER BY total_exec_time DESC
