@@ -82,3 +82,45 @@ JOIN pg_class c ON c.oid = i.indexrelid
 JOIN pg_class t ON t.oid = i.indrelid
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE NOT i.indisvalid;
+
+-- 3.9 Bloat
+WITH constants AS (
+    SELECT current_setting('block_size')::numeric AS bs,
+           23 AS hdr,
+           8 AS ma
+),
+no_stats AS (
+    SELECT table_schema, table_name,
+           n_live_tup::numeric AS est_rows,
+           pg_table_size(relid)::numeric AS table_bytes
+    FROM pg_stat_user_tables
+    JOIN information_schema.columns
+      ON table_schema = schemaname AND table_name = relname
+    GROUP BY table_schema, table_name, relid, n_live_tup
+),
+null_headers AS (
+    SELECT hdr + 1 + (sum(CASE WHEN null_frac <> 0 THEN 1 ELSE 0 END) / 8) AS nullhdr,
+           sum((1 - null_frac) * avg_width) AS datawidth,
+           max(null_frac) AS maxfracsum,
+           schemaname, tablename, hdr, ma, bs
+    FROM pg_stats CROSS JOIN constants
+    GROUP BY schemaname, tablename, hdr, ma, bs
+),
+table_est AS (
+    SELECT schemaname, tablename,
+           bs * ceil(reltuples / NULLIF((bs - 20) / (datawidth + nullhdr), 0)) AS est_bytes,
+           relpages * bs AS real_bytes
+    FROM null_headers
+    JOIN pg_class ON tablename = relname
+    JOIN pg_namespace ON relnamespace = pg_namespace.oid AND schemaname = nspname
+    WHERE relkind = 'r'
+)
+SELECT schemaname, tablename,
+       pg_size_pretty(real_bytes::bigint) AS real_size,
+       pg_size_pretty(est_bytes::bigint) AS est_size,
+       round(100 * (real_bytes - est_bytes) / NULLIF(real_bytes, 0), 1) AS bloat_pct,
+       pg_size_pretty((real_bytes - est_bytes)::bigint) AS wasted
+FROM table_est
+WHERE real_bytes > 10 * 1024 * 1024
+ORDER BY real_bytes - est_bytes DESC
+LIMIT 20;
