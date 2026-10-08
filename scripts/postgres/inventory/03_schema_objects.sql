@@ -108,8 +108,8 @@ null_headers AS (
 ),
 table_est AS (
     SELECT schemaname, tablename,
-           bs * ceil(reltuples / NULLIF((bs - 20) / (datawidth + nullhdr), 0)) AS est_bytes,
-           relpages * bs AS real_bytes
+           (bs * ceil(reltuples / NULLIF((bs - 20) / (datawidth + nullhdr), 0)))::numeric AS est_bytes,
+           (relpages * bs)::numeric AS real_bytes
     FROM null_headers
     JOIN pg_class ON tablename = relname
     JOIN pg_namespace ON relnamespace = pg_namespace.oid AND schemaname = nspname
