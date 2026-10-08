@@ -33,7 +33,9 @@ LIMIT 25;
 
 -- 3.4 Queries spilling to temp files (work_mem too small)
 SELECT queryid, calls, temp_blks_read, temp_blks_written,
-       pg_size_pretty(temp_blks_written * 8192) AS temp_written, left(query, 200) AS query
+       pg_size_pretty(temp_blks_read * current_setting('block_size')::bigint) AS temp_read,
+       pg_size_pretty(temp_blks_written * current_setting('block_size')::bigint) AS temp_written,
+       left(query, 200) AS query
 FROM pg_stat_statements
 WHERE temp_blks_written > 0
 ORDER BY temp_blks_written DESC
