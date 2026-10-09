@@ -160,7 +160,7 @@ LIMIT 20;
 -- 5.8 Invalid or not-ready indexes (failed CREATE INDEX CONCURRENTLY leaves these behind)
 -- An index being built right now also shows up here; check 5.6 first.
 -- Fix: DROP INDEX CONCURRENTLY <name>; then retry the build.
-:regclass AS "table",
+SELECT i.indexrelid::regclass AS "index", i.indrelid::regclass AS "table",
        i.indisvalid, i.indisready, i.indislive,
        pg_size_pretty(pg_relation_size(i.indexrelid)) AS size,
        pg_get_indexdef(i.indexrelid) AS definition
