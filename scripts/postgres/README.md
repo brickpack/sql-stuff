@@ -9,7 +9,7 @@ cover roughly 2026-08-24 onward and describe the **writer instance only**, not t
 
 ## The loop
 
-1. **Is it healthy?** Run `health_check.sql` (one query, one row per check).
+1. **Is it healthy?** Run `00_health_check.sql` (one query, one row per check).
 2. **What is happening right now?**
    - `01_connections_activity.sql`: 1.3 running queries, 1.4 wait events, 1.5 idle-in-transaction.
    - `02_locks_blocking.sql`: 2.1 and 2.2 for blocked sessions and root blockers.
