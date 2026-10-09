@@ -33,10 +33,14 @@ WHERE b.rolname IN ('rds_superuser', 'pg_execute_server_program', 'pg_read_serve
 ORDER BY 1, 2;
 
 -- 4.3 Login roles: password expiry (NULL expiry is normal for service accounts, but worth knowing)
+-- VALID UNTIL 'infinity' also means "never expires"; it must not be used in date arithmetic.
 SELECT rolname, rolvaliduntil,
-       round(extract(epoch FROM rolvaliduntil - now()) / 86400) AS days_left,
-       CASE WHEN rolvaliduntil < now() THEN 'EXPIRED'
-            WHEN rolvaliduntil IS NULL THEN 'no expiry' ELSE 'ok' END AS status
+       CASE WHEN rolvaliduntil IS NOT NULL AND isfinite(rolvaliduntil)
+            THEN round(extract(epoch FROM rolvaliduntil - now()) / 86400) END AS days_left,
+       CASE WHEN rolvaliduntil IS NULL THEN 'no expiry'
+            WHEN NOT isfinite(rolvaliduntil) THEN 'never expires (infinity)'
+            WHEN rolvaliduntil < now() THEN 'EXPIRED'
+            ELSE 'ok' END AS status
 FROM pg_roles
 WHERE rolcanlogin
 ORDER BY rolvaliduntil NULLS FIRST, rolname;
