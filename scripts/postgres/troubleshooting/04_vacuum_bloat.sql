@@ -1,4 +1,5 @@
 -- Vacuum, bloat and transaction ID wraparound. Requires PG 16+.
+-- Aurora note: 4.7 includes Aurora reader feedback (aurora_replica_status()); that branch errors on non-Aurora.
 
 -- 4.1 Dead tuples and last (auto)vacuum/analyze
 SELECT schemaname, relname, n_live_tup, n_dead_tup,
@@ -55,6 +56,7 @@ ORDER BY pct_of_vac_threshold DESC NULLS LAST
 LIMIT 30;
 
 -- 4.3 Autovacuum / vacuum in progress
+-- Dead-tuple counters differ by version (PG16: num_dead_tuples; PG17+: num_dead_item_ids), so omitted.
 SELECT p.pid, p.datname, a.backend_type,
        CASE WHEN p.datname = current_database() THEN p.relid::regclass::text END AS relation,
        p.phase,
@@ -68,7 +70,6 @@ SELECT p.pid, p.datname, a.backend_type,
 FROM pg_stat_progress_vacuum p
 LEFT JOIN pg_stat_activity a USING (pid)
 ORDER BY running_for DESC NULLS LAST;
--- Dead-tuple counters differ by version (PG16: num_dead_tuples; PG17+: num_dead
 
 -- 4.4 Per-table autovacuum storage-parameter overrides
 SELECT n.nspname AS schema, c.relname, c.relkind, c.reloptions,
@@ -78,7 +79,7 @@ JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE c.reloptions IS NOT NULL AND c.relkind IN ('r', 'm', 't')
 ORDER BY autovac_disabled DESC, 1, 2;
 
--- 4.5 Transaction ID wraparound risk by database (freeze_max_age default 200M,
+-- 4.5 Transaction ID wraparound risk by database (freeze_max_age default 200M, hard limit ~2.1B)
 SELECT datname, age(datfrozenxid) AS xid_age,
        round(100.0 * age(datfrozenxid) / 2100000000, 2) AS pct_to_wraparound,
        round(100.0 * age(datfrozenxid) / current_setting('autovacuum_freeze_max_age')::numeric, 1) AS pct_of_freeze_max_age,
@@ -115,6 +116,11 @@ UNION ALL
 SELECT 'standby feedback', pid::text, backend_xmin, age(backend_xmin),
        concat_ws(', ', application_name, client_addr::text, state)
 FROM pg_stat_replication WHERE backend_xmin IS NOT NULL
+UNION ALL
+SELECT 'aurora reader', server_id::text, feedback_xmin::text::xid, age(feedback_xmin::text::xid),
+       concat_ws(', ', 'lag ' || replica_lag_in_msec || ' ms', 'active_txns ' || active_txns)
+FROM aurora_replica_status()
+WHERE session_id <> 'MASTER_SESSION_ID' AND feedback_xmin IS NOT NULL
 UNION ALL
 SELECT 'prepared xact', gid, transaction, age(transaction),
        concat_ws(', ', owner, 'prepared ' || prepared::text)
