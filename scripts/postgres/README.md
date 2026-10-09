@@ -11,9 +11,9 @@ cover roughly 2026-08-24 onward and describe the **writer instance only**, not t
 
 1. **Is it healthy?** Run `health_check.sql` (one query, one row per check).
 2. **What is happening right now?**
-   - `1_connections_activity.sql`: 1.3 running queries, 1.4 wait events, 1.5 idle-in-transaction.
-   - `2_locks_blocking.sql`: 2.1 and 2.2 for blocked sessions and root blockers.
-3. **What has been expensive over time?** `3_query_performance.sql`: 3.1b for the `web` role (kept separate
+   - `01_connections_activity.sql`: 1.3 running queries, 1.4 wait events, 1.5 idle-in-transaction.
+   - `02_locks_blocking.sql`: 2.1 and 2.2 for blocked sessions and root blockers.
+3. **What has been expensive over time?** `03_query_performance.sql`: 3.1b for the `web` role (kept separate
    from maintenance roles such as `root` and `dms`), plus 3.9 and 3.10. The counters span about 45 days, so recent
    regressions are diluted: use the 3.13 snapshot-diff to see what changed lately.
 4. **Classify each offender by its signature** (see the four concerns below).
@@ -103,13 +103,13 @@ cover roughly 2026-08-24 onward and describe the **writer instance only**, not t
 | File | Contents |
 |------|----------|
 | `health_check.sql` | One-shot checklist, one row per check, plus an Aurora reader add-on |
-| `0_instance_overview.sql` | Version, settings, extensions, sizes, sequences close to exhaustion |
-| `1_connections_activity.sql` | Connections, running queries, waits, idle-in-transaction, oldest transactions |
-| `2_locks_blocking.sql` | Blocked sessions, root blockers, blocking tree, locks, advisory locks |
-| `3_query_performance.sql` | `pg_stat_statements` rankings, temp spill, WAL, snapshot-diff |
-| `4_vacuum_bloat.sql` | Dead tuples, autovacuum progress, wraparound, xmin holders, bloat estimate |
-| `5_index_health.sql` | Unused, duplicate, missing and invalid indexes, FK coverage |
-| `6_io_cache_wal.sql` | Cache hit ratios, `pg_stat_io`, checkpoints, WAL (limited on Aurora) |
+| `instance_overview.sql` | Version, settings, extensions, sizes, sequences close to exhaustion |
+| `01_connections_activity.sql` | Connections, running queries, waits, idle-in-transaction, oldest transactions |
+| `02_locks_blocking.sql` | Blocked sessions, root blockers, blocking tree, locks, advisory locks |
+| `03_query_performance.sql` | `pg_stat_statements` rankings, temp spill, WAL, snapshot-diff |
+| `04_vacuum_bloat.sql` | Dead tuples, autovacuum progress, wraparound, xmin holders, bloat estimate |
+| `05_index_health.sql` | Unused, duplicate, missing and invalid indexes, FK coverage |
+| `06_io_cache_wal.sql` | Cache hit ratios, `pg_stat_io`, checkpoints, WAL (limited on Aurora) |
 | `database_inventory.sql` | Databases, roles settings, publications and slots |
 | `roles_security.sql` | Roles, privileges, RLS, security definer functions |
 | `replication_ha.sql` | Slots, publications, replica identity, Aurora cluster members |
