@@ -142,6 +142,19 @@ LEFT JOIN pg_database d ON d.oid = s.dbid
 ORDER BY s.calls DESC
 LIMIT 25;
 
+SELECT queryid, calls,
+       round(mean_exec_time::numeric, 3)                 AS mean_ms,
+       round(rows::numeric / calls, 2)                   AS rows_per_call,
+       round(total_exec_time::numeric / 1000)            AS total_s,
+       left(regexp_replace(query, '\s+', ' ', 'g'), 140) AS query
+FROM pg_stat_statements
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND calls > 50000 AND mean_exec_time < 2
+  AND rows::numeric / calls <= 2
+  AND query ILIKE 'select%'
+ORDER BY total_exec_time DESC
+LIMIT 50;
+
 -- 3.10 Unstable queries (high variance: sometimes fast, sometimes slow; often plan flips or lock waits)
 SELECT s.queryid, d.datname, s.calls,
        round(s.mean_exec_time::numeric, 2) AS mean_ms,
